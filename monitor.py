@@ -96,47 +96,45 @@ def is_separator_row(cells):
 
 
 def parse_tables(markdown):
-    """Parse only the ComparePV 'Price offers' table.
+    """Parse the ComparePV offers table by its exact column structure.
 
-    Jina returns the whole ComparePV page, which contains other tables with
-    numbers/currency values. Looking for any table containing a 'Price' column
-    can therefore accidentally capture an unrelated value. We anchor parsing
-    to the 'Price offers' section.
+    Jina can return the page with headings flattened or reformatted. Therefore
+    we do not depend on a '## Price offers' heading being present. Instead we
+    look for the distinctive ComparePV offers header:
+    Shop | Country | Price | Per kWp | Stock | Offer updated | Link to shop
     """
     offers = []
     lines = markdown.splitlines()
 
-    section_start = None
     for i, line in enumerate(lines):
-        if re.search(r"^\s*#{1,6}\s*Price offers\b", line, re.I):
-            section_start = i
-            break
+        header = split_md_row(line)
+        if len(header) < 6:
+            continue
 
-    if section_start is None:
-        return offers
+        normalized = [clean_markdown(x).lower() for x in header]
 
-    # Find the first Markdown table after "Price offers".
-    for i in range(section_start + 1, min(len(lines), section_start + 30)):
-        header = split_md_row(lines[i])
-        if len(header) < 4:
+        # Exact/near-exact identification of the ComparePV offers table.
+        has_shop = any(x == "shop" for x in normalized)
+        has_country = any(x == "country" for x in normalized)
+        has_price = any(x == "price" for x in normalized)
+        has_stock = any(x == "stock" for x in normalized)
+        has_updated = any("offer updated" in x for x in normalized)
+
+        if not (has_shop and has_country and has_price and has_stock and has_updated):
             continue
 
         separator = split_md_row(lines[i + 1]) if i + 1 < len(lines) else []
         if not is_separator_row(separator):
             continue
 
-        normalized = [clean_markdown(x).lower() for x in header]
-        price_idx = next((j for j, x in enumerate(normalized) if x == "price" or "price" in x), None)
-        shop_idx = next((j for j, x in enumerate(normalized) if x == "shop" or "shop" in x), None)
-        country_idx = next((j for j, x in enumerate(normalized) if "country" in x), None)
-        stock_idx = next((j for j, x in enumerate(normalized) if "stock" in x), None)
-        updated_idx = next((j for j, x in enumerate(normalized) if "updated" in x), None)
+        price_idx = normalized.index("price")
+        shop_idx = normalized.index("shop")
+        country_idx = normalized.index("country")
+        stock_idx = normalized.index("stock")
+        updated_idx = next(j for j, x in enumerate(normalized) if "offer updated" in x)
 
-        if price_idx is None or shop_idx is None:
-            continue
-
-        for line in lines[i + 2:]:
-            cells = split_md_row(line)
+        for row_line in lines[i + 2:]:
+            cells = split_md_row(row_line)
             if not cells:
                 break
             if len(cells) != len(header):
@@ -144,24 +142,22 @@ def parse_tables(markdown):
 
             shop = clean_markdown(cells[shop_idx])
             price, currency = parse_price(cells[price_idx])
+
             if not shop or price is None:
                 continue
 
-            country = clean_markdown(cells[country_idx]) if country_idx is not None else ""
-            stock = clean_markdown(cells[stock_idx]) if stock_idx is not None else ""
-            updated = clean_markdown(cells[updated_idx]) if updated_idx is not None else ""
-
             offers.append({
                 "shop": shop,
-                "country": country,
+                "country": clean_markdown(cells[country_idx]),
                 "price": price,
                 "currency": currency,
-                "stock": stock,
-                "updated": updated,
+                "stock": clean_markdown(cells[stock_idx]),
+                "updated": clean_markdown(cells[updated_idx]),
             })
 
-        # We found the Price offers table; do not scan later page tables.
-        return offers
+        # Stop after the first actual offers table.
+        if offers:
+            return offers
 
     return offers
 
