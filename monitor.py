@@ -2,14 +2,17 @@
 """
 Daily ComparePV price monitor.
 
-- Reads ComparePV's plain-Markdown offers pages.
-- Looks for selected PV modules in Polish offers.
-- Saves a historical CSV under data/prices.csv.
-- Prints alerts when a tracked offer changes price or when a new/cheaper
-  offer appears.
+This version reads the Markdown representation of the individual ComparePV
+panel pages instead of trying to scrape the whole offers table. That makes
+the matching much more reliable: each URL represents one exact panel family.
 
-The script deliberately treats ComparePV as the source of the observed
-price, not as the seller. Before buying, verify the shop's own listing.
+It:
+- checks selected panel pages,
+- records Polish offers (and other countries if present),
+- saves history to data/prices.csv,
+- reports price changes,
+- reports prices below configured thresholds,
+- does NOT fail just because a selected panel currently has no offers.
 """
 
 from __future__ import annotations
@@ -21,203 +24,189 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlencode
 
 import requests
 
-BASE_URL = "https://comparepv.com/offers.md"
 
-# Number of result pages to inspect. ComparePV's Polish panel market is
-# currently around 1,300 offers, so 15 pages x 100 covers the current range.
-MAX_PAGES = int(os.getenv("COMPAREPV_MAX_PAGES", "15"))
-PAGE_SIZE = 100
+# ---------------------------------------------------------------------------
+# Panels to monitor
+# ---------------------------------------------------------------------------
+# The ComparePV panel page is the important part. The offer names on shops
+# may contain suffixes such as _BFT / _BF / _FB, while ComparePV groups them
+# under the corresponding catalogue panel page.
 
-# Edit this list as we add/remove panels.
-TRACKED_MODELS = {
-    "JA Solar JAM54D40-465/LB_BFT": [
-        "JAM54D40-465/LB_BFT",
-        "JAM54D40-465/LB BF",
-    ],
-    "JA Solar JAM54D40-465/LR_BF": [
-        "JAM54D40-465/LR_BF",
-        "JAM54D40-465 LR BF",
-    ],
-    "JA Solar JAM54D41-465/LR_FB": [
-        "JAM54D41-465/LR_FB",
-        "JAM54D41-465 LR FB",
-    ],
-    "JA Solar JAM54D41-460/LB_FB": [
-        "JAM54D41-460/LB_FB",
-        "JAM54D41-460 LB FB",
-    ],
-    "Recom 375W Full Black": [
-        "Recom 375W Full Black",
-        "RCM-375-6ME",
-    ],
-}
-
-ALERT_PRICE_PLN = {
-    "JA Solar JAM54D40-465/LB_BFT": 330.0,
-    "JA Solar JAM54D40-465/LR_BF": 320.0,
-    "JA Solar JAM54D41-465/LR_FB": 330.0,
-    "JA Solar JAM54D41-460/LB_FB": 325.0,
-    "Recom 375W Full Black": 220.0,
+TRACKED_PANELS = {
+    "JA Solar JAM54D40-465/LB": {
+        "url": "https://comparepv.com/panel/ja-solar-jam54d40-465-lb.md",
+        "alert_pln": 340.0,
+    },
+    "JA Solar JAM54D40-465/LR": {
+        "url": "https://comparepv.com/panel/ja-solar-jam54d40-465-lr.md",
+        "alert_pln": 325.0,
+    },
+    "JA Solar JAM54D40-460/LB": {
+        "url": "https://comparepv.com/panel/ja-solar-jam54d40-460-lb-1.md",
+        "alert_pln": 315.0,
+    },
+    "JA Solar JAM54D40-460/LR": {
+        "url": "https://comparepv.com/panel/ja-solar-jam54d40-460-lr.md",
+        "alert_pln": 315.0,
+    },
 }
 
 DATA_FILE = Path("data/prices.csv")
 TIMEOUT = 30
+REQUEST_DELAY = 0.5
 
 CSV_FIELDS = [
     "checked_at_utc",
     "model",
-    "product",
     "shop",
     "country",
-    "price_pln",
+    "price",
+    "currency",
     "vat",
     "stock",
     "updated",
     "source_url",
 ]
 
-
-def normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", text.strip()).casefold()
-
-
-def fetch_page(page: int) -> str:
-    params = {
-        "country": "PL",
-        "currency": "PLN",
-        "product_type": "panel",
-        "matched": "true",
-        "page_size": PAGE_SIZE,
-        "page": page,
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": (
+            "pv-price-monitor/2.0 "
+            "(personal daily PV price monitoring)"
+        ),
+        "Accept": "text/markdown,text/plain;q=0.9,*/*;q=0.1",
     }
-    url = f"{BASE_URL}?{urlencode(params)}"
-    response = requests.get(
-        url,
-        timeout=TIMEOUT,
-        headers={
-            "User-Agent": "pv-price-monitor/1.0 (personal price monitoring)",
-            "Accept": "text/markdown,text/plain;q=0.9,*/*;q=0.1",
-        },
+)
+
+
+def clean(text: str) -> str:
+    """Collapse whitespace and Markdown table noise."""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("\u00a0", " ")
+    text = text.replace("🇵🇱", "Poland")
+    text = text.replace("🇩🇪", "Germany")
+    text = text.replace("🇨🇿", "Czechia")
+    text = text.replace("🇮🇹", "Italy")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" |")
+
+
+def parse_price_cell(cell: str) -> tuple[float | None, str]:
+    """
+    Parse e.g.
+      346 zł incl. VAT
+      2 493 Kč incl. VAT
+      76.62 € incl. VAT
+    """
+    s = clean(cell)
+    m = re.search(
+        r"(?<!\d)(\d[\d\s\u202f]*(?:[.,]\d{1,2})?)\s*(zł|PLN|€|EUR|Kč|CZK)",
+        s,
+        re.I,
     )
-    response.raise_for_status()
-    return response.text
+    if not m:
+        return None, ""
 
+    raw = m.group(1).replace(" ", "").replace("\u202f", "")
+    # European decimal comma.
+    if "," in raw:
+        raw = raw.replace(".", "").replace(",", ".")
+    else:
+        # Keep a dot as decimal separator.
+        pass
 
-def parse_price(text: str) -> float | None:
-    # Handles "346.28 zł", "350 zł", and thousands separators.
-    match = re.search(r"(?<!\d)(\d{1,3}(?:[ .]\d{3})*(?:[,.]\d{1,2})?|\d+(?:[,.]\d{1,2})?)\s*zł", text, re.I)
-    if not match:
-        return None
-
-    value = match.group(1).replace(" ", "").replace(".", "").replace(",", ".")
-    # If the source used a dot as decimal separator, undo the thousands
-    # conversion for values such as 346.28.
-    raw = match.group(1).replace(" ", "")
-    if "." in raw and "," not in raw and len(raw.split(".")[-1]) == 2:
-        value = raw
     try:
-        return float(value)
+        return float(raw), m.group(2)
     except ValueError:
-        return None
+        return None, ""
 
 
-def model_for(text: str) -> str | None:
-    n = normalize(text)
-    for model, needles in TRACKED_MODELS.items():
-        if any(normalize(needle) in n for needle in needles):
-            return model
-    return None
-
-
-def parse_offer_lines(markdown: str) -> list[dict]:
+def parse_markdown_table(markdown: str, source_url: str) -> list[dict]:
     """
-    Parse the readable text returned by ComparePV's .md endpoint.
-
-    ComparePV's plain-Markdown format can evolve. We therefore use a
-    deliberately tolerant line-based parser rather than relying on HTML.
+    Extract rows from ComparePV's:
+      Shop | Country | Price | Per kWp | Stock | Offer updated | Link to shop
+    table.
     """
-    results: list[dict] = []
-    lines = [re.sub(r"\s+", " ", x).strip() for x in markdown.splitlines() if x.strip()]
+    lines = [line.strip() for line in markdown.splitlines() if line.strip()]
 
+    header_index = None
     for i, line in enumerate(lines):
-        model = model_for(line)
-        if not model:
+        n = clean(line).casefold()
+        if (
+            "shop" in n
+            and "country" in n
+            and "price" in n
+            and "stock" in n
+            and "offer updated" in n
+        ):
+            header_index = i
+            break
+
+    if header_index is None:
+        return []
+
+    rows: list[dict] = []
+
+    for line in lines[header_index + 1 :]:
+        if not line.startswith("|"):
+            # The table normally ends before the next heading/paragraph.
+            if rows and line.startswith("#"):
+                break
             continue
 
-        price = parse_price(line)
-        if price is None:
-            # Sometimes the price is separated from the product line.
-            nearby = " ".join(lines[i : i + 3])
-            price = parse_price(nearby)
+        cells = [clean(x) for x in line.strip().strip("|").split("|")]
 
-        if price is None:
+        # Separator row: |---|---|---|
+        if cells and all(re.fullmatch(r":?-{2,}:?", c or "") for c in cells):
             continue
 
-        # ComparePV commonly presents:
-        # Product ... Panels ... Shop ... Poland ... 346.28 zł incl. VAT In stock ...
-        shop = ""
-        country = "PL"
-        vat = ""
-        stock = ""
-        updated = ""
+        if len(cells) < 6:
+            continue
 
-        # Country is fixed by our query, but keep the first recognizable
-        # shop/country/stock information from the surrounding text.
-        context = " ".join(lines[max(0, i - 1) : min(len(lines), i + 3)])
+        shop = cells[0]
+        country = cells[1]
+        price, currency = parse_price_cell(cells[2])
+        stock = cells[4]
+        updated = cells[5]
 
-        stock_match = re.search(
-            r"\b(In stock|Out of stock|Available|Unavailable)\b",
-            context,
-            re.I,
-        )
-        if stock_match:
-            stock = stock_match.group(1)
+        if not shop or price is None:
+            continue
 
-        vat_match = re.search(r"\b(incl\. VAT|excl\. VAT)\b", context, re.I)
-        if vat_match:
-            vat = vat_match.group(1)
-
-        updated_match = re.search(
-            r"(\d+\s*(?:min|mins|h|d)\s*ago|yesterday|today)",
-            context,
-            re.I,
-        )
-        if updated_match:
-            updated = updated_match.group(1)
-
-        # Try to recover a shop name from common ComparePV row ordering.
-        shop_match = re.search(
-            r"\bPanels?\b\s+(?:Panel page\s+)?(.+?)\s+PL\b",
-            context,
-            re.I,
-        )
-        if shop_match:
-            shop = shop_match.group(1).strip()
-
-        results.append(
+        rows.append(
             {
-                "model": model,
-                "product": line,
                 "shop": shop,
                 "country": country,
-                "price_pln": round(price, 2),
-                "vat": vat,
+                "price": round(price, 2),
+                "currency": currency,
+                "vat": (
+                    "incl. VAT"
+                    if "incl. vat" in cells[2].casefold()
+                    else "excl. VAT"
+                    if "excl. vat" in cells[2].casefold()
+                    else ""
+                ),
                 "stock": stock,
                 "updated": updated,
-                "source_url": BASE_URL,
+                "source_url": source_url.removesuffix(".md"),
             }
         )
 
-    # De-duplicate rows created by overlapping context.
-    unique = {}
-    for row in results:
-        key = (row["model"], row["product"], row["shop"], row["price_pln"])
-        unique[key] = row
-    return list(unique.values())
+    return rows
+
+
+def fetch_panel(model: str, cfg: dict) -> list[dict]:
+    url = cfg["url"]
+    response = SESSION.get(url, timeout=TIMEOUT)
+    response.raise_for_status()
+
+    rows = parse_markdown_table(response.text, url)
+    for row in rows:
+        row["model"] = model
+    return rows
 
 
 def load_previous() -> list[dict]:
@@ -230,6 +219,7 @@ def load_previous() -> list[dict]:
 def append_history(rows: list[dict]) -> None:
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     exists = DATA_FILE.exists()
+
     with DATA_FILE.open("a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         if not exists:
@@ -237,61 +227,102 @@ def append_history(rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def alert(rows: list[dict], previous: list[dict]) -> None:
-    previous_latest: dict[tuple[str, str], float] = {}
+def latest_prices(previous: list[dict]) -> dict[tuple[str, str, str], float]:
+    result: dict[tuple[str, str, str], float] = {}
+
     for row in previous:
         try:
-            key = (row["model"], row["shop"])
-            previous_latest[key] = float(row["price_pln"])
-        except (KeyError, ValueError):
+            key = (row["model"], row["shop"], row["currency"])
+            result[key] = float(row["price"])
+        except (KeyError, TypeError, ValueError):
             continue
 
-    messages = []
-    for row in rows:
-        key = (row["model"], row["shop"])
-        old = previous_latest.get(key)
-        new = row["price_pln"]
+    return result
 
-        if old is not None and abs(new - old) >= 0.01:
-            direction = "↓" if new < old else "↑"
-            pct = (new - old) / old * 100
+
+def print_alerts(rows: list[dict], previous: list[dict]) -> None:
+    old = latest_prices(previous)
+    messages: list[str] = []
+
+    for row in rows:
+        key = (row["model"], row["shop"], row["currency"])
+        price = float(row["price"])
+        old_price = old.get(key)
+
+        if old_price is not None and abs(price - old_price) >= 0.01:
+            pct = (price - old_price) / old_price * 100
+            direction = "DOWN" if price < old_price else "UP"
             messages.append(
-                f"{direction} {row['model']} | {row['shop'] or 'shop?'} | "
-                f"{old:.2f} -> {new:.2f} zł ({pct:+.1f}%)"
+                f"{direction}: {row['model']} | {row['shop']} | "
+                f"{old_price:.2f} -> {price:.2f} {row['currency']} "
+                f"({pct:+.1f}%)"
             )
 
-        threshold = ALERT_PRICE_PLN.get(row["model"])
-        if threshold is not None and new <= threshold:
+        # Thresholds are meaningful for PLN offers only.
+        threshold = TRACKED_PANELS[row["model"]].get("alert_pln")
+        if (
+            threshold is not None
+            and row["currency"].casefold() in {"zł", "pln"}
+            and price <= threshold
+        ):
             messages.append(
-                f"🔔 BELOW THRESHOLD: {row['model']} | "
-                f"{row['shop'] or 'shop?'} | {new:.2f} zł <= {threshold:.2f} zł"
+                f"ALERT: {row['model']} | {row['shop']} | "
+                f"{price:.2f} zł <= {threshold:.2f} zł"
             )
 
     if messages:
-        print("\nALERTS")
-        print("\n".join(messages))
+        print("\n=== ALERTS ===")
+        for message in messages:
+            print(message)
+    else:
+        print("\nNo price-change/threshold alerts.")
 
 
 def main() -> int:
     checked_at = datetime.now(timezone.utc).isoformat()
+
     all_rows: list[dict] = []
+    errors: list[str] = []
 
-    for page in range(1, MAX_PAGES + 1):
+    for model, cfg in TRACKED_PANELS.items():
         try:
-            text = fetch_page(page)
+            rows = fetch_panel(model, cfg)
+            all_rows.extend(rows)
+
+            pl_rows = [
+                r for r in rows
+                if r["currency"].casefold() in {"zł", "pln"}
+            ]
+            if pl_rows:
+                cheapest = min(pl_rows, key=lambda r: r["price"])
+                print(
+                    f"{model}: {len(pl_rows)} Polish offers; "
+                    f"cheapest {cheapest['price']:.2f} zł "
+                    f"({cheapest['shop']})"
+                )
+            else:
+                print(f"{model}: no Polish offers currently.")
+
         except requests.RequestException as exc:
-            print(f"ERROR: ComparePV page {page}: {exc}", file=sys.stderr)
-            continue
+            message = f"{model}: request failed: {exc}"
+            print(f"ERROR: {message}", file=sys.stderr)
+            errors.append(message)
+        except Exception as exc:
+            message = f"{model}: parser failed: {exc}"
+            print(f"ERROR: {message}", file=sys.stderr)
+            errors.append(message)
 
-        rows = parse_offer_lines(text)
-        all_rows.extend(rows)
-        print(f"page={page}: {len(rows)} tracked offers")
+        time.sleep(REQUEST_DELAY)
 
-        # Avoid hammering the site.
-        time.sleep(0.5)
-
+    # A complete lack of rows can be caused by a site/API change.
+    # Treat that as a failure so GitHub Actions clearly shows a problem.
     if not all_rows:
-        print("ERROR: no tracked offers found; history was not modified.", file=sys.stderr)
+        print(
+            "ERROR: no offers were parsed from any tracked panel page.",
+            file=sys.stderr,
+        )
+        if errors:
+            print("\n".join(errors), file=sys.stderr)
         return 2
 
     for row in all_rows:
@@ -299,11 +330,19 @@ def main() -> int:
 
     previous = load_previous()
     append_history(all_rows)
-    alert(all_rows, previous)
+    print_alerts(all_rows, previous)
 
-    print(f"\nSaved {len(all_rows)} offers to {DATA_FILE}")
+    print(f"\nSaved {len(all_rows)} offer rows to {DATA_FILE}")
+
+    if errors:
+        print(
+            f"Completed with {len(errors)} panel/page error(s). "
+            "Successful rows were saved."
+        )
+
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
