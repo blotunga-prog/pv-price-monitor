@@ -95,17 +95,38 @@ def is_separator_row(cells):
 
 
 def parse_tables(markdown):
+    """Parse only the ComparePV 'Price offers' table.
+
+    Jina returns the whole ComparePV page, which contains other tables with
+    numbers/currency values. Looking for any table containing a 'Price' column
+    can therefore accidentally capture an unrelated value. We anchor parsing
+    to the 'Price offers' section.
+    """
     offers = []
     lines = markdown.splitlines()
 
-    for i in range(len(lines) - 1):
+    section_start = None
+    for i, line in enumerate(lines):
+        if re.search(r"^\s*#{1,6}\s*Price offers\b", line, re.I):
+            section_start = i
+            break
+
+    if section_start is None:
+        return offers
+
+    # Find the first Markdown table after "Price offers".
+    for i in range(section_start + 1, min(len(lines), section_start + 30)):
         header = split_md_row(lines[i])
-        if len(header) < 4 or not is_separator_row(split_md_row(lines[i + 1])):
+        if len(header) < 4:
+            continue
+
+        separator = split_md_row(lines[i + 1]) if i + 1 < len(lines) else []
+        if not is_separator_row(separator):
             continue
 
         normalized = [clean_markdown(x).lower() for x in header]
-        price_idx = next((j for j, x in enumerate(normalized) if "price" in x), None)
-        shop_idx = next((j for j, x in enumerate(normalized) if "shop" in x), None)
+        price_idx = next((j for j, x in enumerate(normalized) if x == "price" or "price" in x), None)
+        shop_idx = next((j for j, x in enumerate(normalized) if x == "shop" or "shop" in x), None)
         country_idx = next((j for j, x in enumerate(normalized) if "country" in x), None)
         stock_idx = next((j for j, x in enumerate(normalized) if "stock" in x), None)
         updated_idx = next((j for j, x in enumerate(normalized) if "updated" in x), None)
@@ -137,6 +158,9 @@ def parse_tables(markdown):
                 "stock": stock,
                 "updated": updated,
             })
+
+        # We found the Price offers table; do not scan later page tables.
+        return offers
 
     return offers
 
@@ -183,6 +207,7 @@ def load_previous():
 
 
 def main():
+    Path(CSV_PATH).parent.mkdir(parents=True, exist_ok=True)
     previous = load_previous()
     checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -261,4 +286,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
