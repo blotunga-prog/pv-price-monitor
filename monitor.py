@@ -257,12 +257,23 @@ def fetch_panel(panel_name, source_url):
 
     offers = parse_tables(text)
 
-    if not offers:
-        preview = " ".join(text[:500].split())
-        raise RuntimeError(
-            f"Zero offers parsed. Response length={len(text)}. "
-            f"Preview: {preview}"
-        )
+    
+if not offers:
+    print(f"--- DIAGNOSTYKA: {panel_name} ---")
+
+    for line in text.splitlines():
+        if "|" in line or re.search(
+            r"shop|country|price|stock|offer|zł|PLN|EUR",
+            line,
+            re.I,
+        ):
+            print(line[:500])
+
+    raise RuntimeError(
+        f"Zero offers parsed. Response length={len(text)}."
+   
+    )
+        
 
     return offers
 
