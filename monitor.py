@@ -1,3 +1,4 @@
+
 import csv
 import os
 import re
@@ -58,7 +59,6 @@ TRACKED_PANELS = {
 
 CSV_PATH = Path("data/prices.csv")
 HISTORY_PATH = Path("data/price_history.csv")
-
 JINA_PREFIX = "https://r.jina.ai/"
 
 FIELDNAMES = [
@@ -75,7 +75,6 @@ FIELDNAMES = [
 ]
 
 SESSION = requests.Session()
-
 SESSION.headers.update({
     "User-Agent": "PV-Price-Monitor/1.0",
     "Accept": "text/plain, text/markdown;q=0.9, */*;q=0.8",
@@ -255,25 +254,15 @@ def fetch_panel(panel_name, source_url):
             f"{len(text)} bytes."
         )
 
-    
     offers = parse_tables(text)
 
     if not offers:
-        print(f"--- DIAGNOSTYKA: {panel_name} ---")
-
-        for line in text.splitlines():
-            if "|" in line or re.search(
-                r"shop|country|price|stock|offer|zł|PLN|EUR",
-                line,
-                re.I,
-            ):
-                print(line[:500])
-
         raise RuntimeError(
-            f"Zero offers parsed. Response length={len(text)}."
+            f"No offers table parsed. Response length={len(text)}."
         )
 
     return offers
+
 
 def load_csv(path):
     if not path.exists():
@@ -432,27 +421,25 @@ def main():
             failed_models += 1
             print(f"ERROR: {model}: {exc}")
 
-    # Do not modify either CSV unless every model was fetched.
-    if failed_models or successful_models != len(TRACKED_PANELS):
-        print(
-            "ERROR: incomplete run. No CSV files were updated. "
-            f"Successful: {successful_models}/{len(TRACKED_PANELS)}; "
-            f"failed: {failed_models}."
-        )
-        raise SystemExit(2)
+    print(
+        f"Collection finished: {successful_models}/"
+        f"{len(TRACKED_PANELS)} models successful; "
+        f"{failed_models} failed."
+    )
 
+    # If nothing was collected, preserve both existing CSV files.
     if not current_rows:
-        print("ERROR: zero offers found. No CSV files were updated.")
+        print("ERROR: zero offers collected. CSV files unchanged.")
         raise SystemExit(2)
 
-    # Read the existing history only after all models succeeded.
+    # Read existing history before preparing either output file.
     try:
         history_rows = load_csv(HISTORY_PATH)
     except Exception as exc:
         print(f"ERROR: could not read price history: {exc}")
         raise SystemExit(2)
 
-    # Each successful run adds a new snapshot of all current offers.
+    # Append only offers actually collected in this run.
     updated_history = history_rows + current_rows
 
     temp_current = None
@@ -487,8 +474,16 @@ def main():
         f"in {HISTORY_PATH}."
     )
     print(f"Total offers parsed: {total_offers}")
-    print(f"Models successful: {successful_models}/{len(TRACKED_PANELS)}")
+    print(
+        f"Models successful: {successful_models}/"
+        f"{len(TRACKED_PANELS)}"
+    )
     print(f"Models failed: {failed_models}")
+
+    # Partial success is enough to save data, but remains visible
+    # as a failed GitHub Actions run for monitoring purposes.
+    if failed_models:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
