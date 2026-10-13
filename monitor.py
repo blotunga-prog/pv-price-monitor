@@ -255,28 +255,25 @@ def fetch_panel(panel_name, source_url):
             f"{len(text)} bytes."
         )
 
+    
     offers = parse_tables(text)
 
-    
-if not offers:
-    print(f"--- DIAGNOSTYKA: {panel_name} ---")
+    if not offers:
+        print(f"--- DIAGNOSTYKA: {panel_name} ---")
 
-    for line in text.splitlines():
-        if "|" in line or re.search(
-            r"shop|country|price|stock|offer|zł|PLN|EUR",
-            line,
-            re.I,
-        ):
-            print(line[:500])
+        for line in text.splitlines():
+            if "|" in line or re.search(
+                r"shop|country|price|stock|offer|zł|PLN|EUR",
+                line,
+                re.I,
+            ):
+                print(line[:500])
 
-    raise RuntimeError(
-        f"Zero offers parsed. Response length={len(text)}."
-   
-    )
-        
+        raise RuntimeError(
+            f"Zero offers parsed. Response length={len(text)}."
+        )
 
     return offers
-
 
 def load_csv(path):
     if not path.exists():
