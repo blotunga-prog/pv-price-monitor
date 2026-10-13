@@ -309,6 +309,10 @@ def fetch_panel(panel_name, source_url):
 
     response.raise_for_status()
     text = response.text
+    
+    if "TSM-465NEG9R.28" in source_url:
+    print("DEBUG TRINA RESPONSE:")
+    print(text[:1500])
 
     if len(text) < 100:
         raise RuntimeError(
