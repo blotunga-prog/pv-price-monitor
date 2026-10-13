@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 from html import unescape
+from urllib.parse import quote, urlparse, parse_qs
 
 import requests
 
@@ -39,8 +40,11 @@ TRACKED_PANELS = {
         "url": "https://comparepv.com/panel/aiko-aiko-a485-mce54mw",
         "alert_pln": None,
     },
-    "Trina Solar TSM-465NED9R.28": {
-        "url": "https://comparepv.com/panel/trina-solar-tsm-465ned9r-28",
+    "Trina Solar TSM-465NEG9R.28": {
+        "url": (
+            "https://comparepv.com/offers"
+            "?country=PL&q=TSM-465NEG9R.28"
+        ),
         "alert_pln": None,
     },
     "Jinko Solar JKM450-475N-48HL4M-DB-Z2-EN (465W)": {
@@ -89,6 +93,24 @@ def clean_markdown(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def normalize_model(text):
+    return re.sub(r"[^A-Z0-9]", "", text.upper())
+
+
+def is_poland(country):
+    """Accept only offers explicitly identified as Polish."""
+    value = clean_markdown(str(country)).strip().lower()
+
+    if value in {"pl", "pol", "poland", "polska"}:
+        return True
+
+    return (
+        "poland" in value
+        or "polska" in value
+        or "🇵🇱" in value
+    )
+
+
 def parse_price(text):
     text = clean_markdown(text)
 
@@ -116,14 +138,12 @@ def parse_price(text):
             raw = raw.replace(".", "").replace(",", ".")
         else:
             raw = raw.replace(",", "")
-
     elif "," in raw:
         parts = raw.split(",")
         if len(parts[-1]) in (1, 2):
             raw = "".join(parts[:-1]) + "." + parts[-1]
         else:
             raw = raw.replace(",", "")
-
     elif raw.count(".") > 1:
         parts = raw.split(".")
         raw = "".join(parts[:-1]) + "." + parts[-1]
@@ -156,14 +176,22 @@ def is_separator_row(cells):
     )
 
 
-def parse_tables(markdown):
+def parse_tables(markdown, source_url):
     offers = []
+
+    query = parse_qs(urlparse(source_url).query)
+    country_filter_applied = (
+        query.get("country", [""])[0].upper() == "PL"
+    )
+    search_term = query.get("q", [""])[0]
+    normalized_search = normalize_model(search_term)
+
     lines = markdown.splitlines()
 
     for i, line in enumerate(lines):
         header = split_md_row(line)
 
-        if len(header) < 6:
+        if len(header) < 5:
             continue
 
         normalized = [
@@ -171,7 +199,7 @@ def parse_tables(markdown):
             for cell in header
         ]
 
-        required = {"shop", "country", "price", "stock"}
+        required = {"shop", "price", "stock"}
 
         if not required.issubset(set(normalized)):
             continue
@@ -190,12 +218,28 @@ def parse_tables(markdown):
 
         price_idx = normalized.index("price")
         shop_idx = normalized.index("shop")
-        country_idx = normalized.index("country")
         stock_idx = normalized.index("stock")
         updated_idx = next(
             j for j, cell in enumerate(normalized)
             if "offer updated" in cell
         )
+
+        country_idx = (
+            normalized.index("country")
+            if "country" in normalized
+            else None
+        )
+
+        product_idx = (
+            normalized.index("product")
+            if "product" in normalized
+            else None
+        )
+
+        # Without a country column, accept data only from a URL
+        # explicitly filtered to Poland.
+        if country_idx is None and not country_filter_applied:
+            continue
 
         for row_line in lines[i + 2:]:
             cells = split_md_row(row_line)
@@ -209,9 +253,25 @@ def parse_tables(markdown):
             if not shop or price is None:
                 continue
 
+            if country_idx is not None:
+                country = clean_markdown(cells[country_idx])
+
+                if not is_poland(country):
+                    continue
+            else:
+                country = "Poland"
+
+            # For a search page, verify the product name when
+            # ComparePV supplies a Product column.
+            if normalized_search and product_idx is not None:
+                product = clean_markdown(cells[product_idx])
+
+                if normalized_search not in normalize_model(product):
+                    continue
+
             offers.append({
                 "shop": shop,
-                "country": clean_markdown(cells[country_idx]),
+                "country": country,
                 "price": price,
                 "currency": currency,
                 "stock": clean_markdown(cells[stock_idx]),
@@ -225,7 +285,9 @@ def parse_tables(markdown):
 
 
 def fetch_panel(panel_name, source_url):
-    jina_url = JINA_PREFIX + source_url
+    # Encode the target URL so its query parameters are sent
+    # to ComparePV rather than interpreted as Jina parameters.
+    jina_url = JINA_PREFIX + quote(source_url, safe="/:")
 
     api_key = os.getenv("JINA_API_KEY")
     headers = {}
@@ -236,7 +298,7 @@ def fetch_panel(panel_name, source_url):
     response = SESSION.get(
         jina_url,
         headers=headers,
-        timeout=30,
+        timeout=45,
     )
 
     if response.status_code == 401:
@@ -254,12 +316,22 @@ def fetch_panel(panel_name, source_url):
             f"{len(text)} bytes."
         )
 
-    offers = parse_tables(text)
+    offers = parse_tables(text, source_url)
 
     if not offers:
         raise RuntimeError(
-            f"No offers table parsed. Response length={len(text)}."
+            f"No Polish offers table parsed. "
+            f"Response length={len(text)}."
         )
+
+    # Final safety check before any offer leaves this function.
+    offers = [
+        offer for offer in offers
+        if is_poland(offer["country"])
+    ]
+
+    if not offers:
+        raise RuntimeError("No offers explicitly identified as Polish.")
 
     return offers
 
@@ -285,6 +357,9 @@ def load_previous_prices():
     previous = {}
 
     for row in rows:
+        if not is_poland(row.get("country", "")):
+            continue
+
         key = (
             row.get("model", ""),
             row.get("shop", ""),
@@ -311,10 +386,7 @@ def write_csv_temp(path, rows):
 
     try:
         with os.fdopen(fd, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(
-                file,
-                fieldnames=FIELDNAMES,
-            )
+            writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
             writer.writeheader()
             writer.writerows(rows)
 
@@ -329,7 +401,11 @@ def write_csv_temp(path, rows):
 
 
 def main():
-    previous = load_previous_prices()
+    try:
+        previous = load_previous_prices()
+    except Exception as exc:
+        print(f"ERROR: could not read current prices: {exc}")
+        raise SystemExit(2)
 
     checked_at = datetime.now(timezone.utc).isoformat(
         timespec="seconds"
@@ -345,17 +421,25 @@ def main():
             offers = fetch_panel(model, cfg["url"])
 
             if not offers:
-                raise RuntimeError("No offers returned.")
+                raise RuntimeError("No Polish offers returned.")
 
             successful_models += 1
             total_offers += len(offers)
 
             for offer in offers:
+                # Defence in depth: never write a non-Polish row.
+                if not is_poland(offer.get("country", "")):
+                    print(
+                        f"SKIP non-Polish offer: {model} / "
+                        f"{offer.get('shop', '')}"
+                    )
+                    continue
+
                 row = {
                     "checked_at_utc": checked_at,
                     "model": model,
                     "shop": offer["shop"],
-                    "country": offer["country"],
+                    "country": "Poland",
                     "price": f'{offer["price"]:.2f}',
                     "currency": offer["currency"],
                     "vat": "",
@@ -366,11 +450,7 @@ def main():
 
                 current_rows.append(row)
 
-                key = (
-                    model,
-                    offer["shop"],
-                    offer["currency"],
-                )
+                key = (model, offer["shop"], offer["currency"])
                 old_price = previous.get(key)
 
                 if (
@@ -399,21 +479,25 @@ def main():
                         f"<= {alert_pln:.2f} PLN"
                     )
 
-            pln_offers = [
-                offer for offer in offers
-                if offer["currency"] == "PLN"
+            model_rows = [
+                row for row in current_rows
+                if row["model"] == model
+            ]
+            pln_rows = [
+                row for row in model_rows
+                if row["currency"] == "PLN"
             ]
 
-            if pln_offers:
-                cheapest = min(pln_offers, key=lambda x: x["price"])
+            if pln_rows:
+                cheapest = min(pln_rows, key=lambda x: float(x["price"]))
                 print(
-                    f"OK: {model}: {len(offers)} offers; "
-                    f"cheapest PLN {cheapest['price']:.2f} "
+                    f"OK: {model}: {len(model_rows)} Polish offers; "
+                    f"cheapest PLN {float(cheapest['price']):.2f} "
                     f"at {cheapest['shop']}"
                 )
             else:
                 print(
-                    f"OK: {model}: {len(offers)} offers; "
+                    f"OK: {model}: {len(model_rows)} Polish offers; "
                     "no PLN offer to compare."
                 )
 
@@ -427,26 +511,30 @@ def main():
         f"{failed_models} failed."
     )
 
-    # If nothing was collected, preserve both existing CSV files.
     if not current_rows:
-        print("ERROR: zero offers collected. CSV files unchanged.")
+        print("ERROR: zero Polish offers collected. CSV files unchanged.")
         raise SystemExit(2)
 
-    # Read existing history before preparing either output file.
     try:
         history_rows = load_csv(HISTORY_PATH)
     except Exception as exc:
         print(f"ERROR: could not read price history: {exc}")
         raise SystemExit(2)
 
-    # Append only offers actually collected in this run.
-    updated_history = history_rows + current_rows
+    # Remove old records that are foreign or whose country is unknown.
+    # Keep only records explicitly identified as Poland.
+    clean_history = [
+        row for row in history_rows
+        if is_poland(row.get("country", ""))
+    ]
+
+    # New records are labelled Poland only after passing the checks above.
+    updated_history = clean_history + current_rows
 
     temp_current = None
     temp_history = None
 
     try:
-        # Prepare both files before replacing either destination.
         temp_current = write_csv_temp(CSV_PATH, current_rows)
         temp_history = write_csv_temp(HISTORY_PATH, updated_history)
 
@@ -468,20 +556,21 @@ def main():
                 except OSError:
                     pass
 
-    print(f"Saved {len(current_rows)} current offers to {CSV_PATH}.")
+    removed_history = len(history_rows) - len(clean_history)
+
+    print(f"Saved {len(current_rows)} Polish offers to {CSV_PATH}.")
     print(
-        f"History now contains {len(updated_history)} records "
+        f"History contains {len(updated_history)} Polish records "
         f"in {HISTORY_PATH}."
     )
-    print(f"Total offers parsed: {total_offers}")
+    print(f"Removed {removed_history} non-Polish/unknown history records.")
+    print(f"Total Polish offers parsed: {total_offers}")
     print(
         f"Models successful: {successful_models}/"
         f"{len(TRACKED_PANELS)}"
     )
     print(f"Models failed: {failed_models}")
 
-    # Partial success is enough to save data, but remains visible
-    # as a failed GitHub Actions run for monitoring purposes.
     if failed_models:
         raise SystemExit(2)
 
