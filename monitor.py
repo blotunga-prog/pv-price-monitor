@@ -287,7 +287,7 @@ def parse_tables(markdown, source_url):
 def fetch_panel(panel_name, source_url):
     # Encode the target URL so its query parameters are sent
     # to ComparePV rather than interpreted as Jina parameters.
-    jina_url = JINA_PREFIX + quote(source_url, safe="/:")
+    jina_url = JINA_PREFIX + source_url
 
     api_key = os.getenv("JINA_API_KEY")
     headers = {}
