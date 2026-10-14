@@ -137,9 +137,7 @@ def now_utc():
     ).isoformat()
 
 def norm(value):
-    value = (value or "").replace("\u00a0", " ")
-    value = value.replace("\u202f", " ")
-return re.sub(r"\s+", " ", value).strip().casefold()
+    return re.sub(r"\s+", " ", value).strip().casefold()
 
 def atomic_write_csv(path, fields, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
