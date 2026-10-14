@@ -10,12 +10,6 @@ from urllib.parse import quote
 
 import requests
 
-# -----------------------------------------------------------
-
-# KONFIGURACJA
-
-# ------------------------------------------------------------
-
 ROOT = Path(file).resolve().parent
 DATA_DIR = ROOT / "data"
 PRICES_FILE = DATA_DIR / "prices.csv"
@@ -49,10 +43,6 @@ DIRECT_SOURCES = [
 ("Allegro", "https://allegro.pl/listing?string={q}"),
 ]
 
-Bezpośrednie strony konkretnych produktów.
-
-Dodajemy tu tylko adresy, które zostały sprawdzone.
-
 PRODUCT_URLS = {
 (
 "JA Solar JAM54D40-465/LB_BFT",
@@ -64,10 +54,6 @@ PRODUCT_URLS = {
 "panele-fotowoltaiczne-bifacial-panele-pv-fotowoltaika.html"
 ),
 }
-
-Progi alertów pozostają bez zmian.
-
-None oznacza, że próg nie został ustalony.
 
 PANELS = {
 "JA Solar JAM54D40-465/LB_BFT": {
@@ -118,8 +104,6 @@ PANELS = {
 "compare": None,
 "alert": None,
 },
-# Kandydat z rodziny Jinko.
-# Nie utożsamiamy go z innymi wariantami DB/BDV.
 "Jinko Solar JKM450-475N-48HL4M-DB-Z2-EN (465W)": {
 "search": "JKM450-475N-48HL4M-DB-Z2-EN",
 "aliases": ["JKM450-475N-48HL4M-DB-Z2-EN"],
@@ -144,12 +128,6 @@ SESSION.headers.update({
 "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.7",
 })
 
-# -----------------------------------------------------------
-
-# NARZĘDZIA
-
-# ------------------------------------------------------------
-
 def log(message):
 print(message, flush=True)
 
@@ -164,7 +142,6 @@ value = value.replace("\u202f", " ")
 return re.sub(r"\s+", " ", value).strip().casefold()
 
 def atomic_write_csv(path, fields, rows):
-"""Zapis atomowy: nie zostawiaj częściowo zapisanego CSV."""
 path.parent.mkdir(parents=True, exist_ok=True)
 
 fd, temp_name = tempfile.mkstemp(
@@ -209,7 +186,6 @@ with path.open(
     return list(csv.DictReader(handle))
 
 def csv_fields(base_fields, rows):
-"""Zachowaj również dodatkowe kolumny ze starszych CSV."""
 result = list(base_fields)
 
 for row in rows:
@@ -220,10 +196,6 @@ for row in rows:
 return result
 
 def exact_model_match(text, info):
-"""
-Dopasowanie pełnego kodu modelu.
-Usuwamy spacje, ale zachowujemy /, - i kropki.
-"""
 haystack = norm(text).replace(" ", "")
 
 for alias in info["aliases"]:
@@ -259,11 +231,6 @@ re.IGNORECASE,
 )
 
 def model_context(text, info):
-"""
-Zwróć fragment tekstu dotyczący konkretnego modelu.
-Preferuj wiersz Model/Kod producenta, bo na stronie produktu
-ceny innych, polecanych paneli występują niżej.
-"""
 lines = (text or "").splitlines()
 aliases = [
 norm(alias).replace(" ", "")
@@ -281,7 +248,6 @@ for index, line in enumerate(lines):
             line,
             re.IGNORECASE,
         ) else 1
-
         matches.append((priority, index))
 
 if not matches:
@@ -296,11 +262,6 @@ end = min(len(lines), index + 23)
 return "\n".join(lines[start:end])
 
 def explicit_gross_price(text):
-"""
-Odczytaj cenę tylko wtedy, gdy jest jawnie oznaczona jako
-brutto/z VAT. Preferuj oznaczenie na tej samej linii,
-aby nie pomylić ceny brutto z sąsiednią ceną netto.
-"""
 lines = (text or "").splitlines()
 
 gross_re = re.compile(
@@ -313,7 +274,6 @@ net_re = re.compile(
     re.IGNORECASE,
 )
 
-# Najpierw szukamy ceny i oznaczenia brutto na tej samej linii.
 for line in lines:
     if not gross_re.search(line) or net_re.search(line):
         continue
@@ -323,8 +283,6 @@ for line in lines:
         if price is not None and 10 <= price <= 10000:
             return round(price, 2)
 
-# Ostrożny wariant dla stron, które rozdzielają cenę
-# i etykietę na sąsiednie linie.
 for index, line in enumerate(lines):
     if net_re.search(line):
         continue
@@ -340,8 +298,6 @@ for index, line in enumerate(lines):
     if not gross_re.search(context):
         continue
 
-    # Nie akceptuj kontekstu zawierającego jednocześnie
-    # etykiety netto i brutto — może dotyczyć dwóch cen.
     if net_re.search(context):
         continue
 
@@ -352,21 +308,23 @@ for index, line in enumerate(lines):
 return None
 
 def stock_quantity(text):
-"""Odczytaj ilość sztuk, jeśli jest wyraźnie podana."""
 patterns = [
 r"(\d[\d ])\sszt.?",
 r"(\d[\d ])\spcs\b",
 ]
 
 for line in (text or "").splitlines():
-    if not re.search(r"(magazyn|dostęp|dostep|stan w feedzie)", line, re.I):
+    if not re.search(
+        r"(magazyn|dostęp|dostep|stan w feedzie)",
+        line,
+        re.IGNORECASE,
+    ):
         continue
 
     for pattern in patterns:
         match = re.search(pattern, line, re.IGNORECASE)
         if match:
-            quantity = re.sub(r"\s+", "", match.group(1))
-            return quantity
+            return re.sub(r"\s+", "", match.group(1))
 
 return ""
 
@@ -398,12 +356,8 @@ if any(term in value for term in (
 return "Not stated"
 
 def shipping_info(text):
-"""
-Odczytaj minimalny koszt wysyłki, jeśli jest podany.
-Nie zakładamy, że jest to koszt dostawy 16 paneli.
-"""
 for line in (text or "").splitlines():
-if not re.search(r"wysyłka\s+od|wysylka\s+od", line, re.I):
+if not re.search(r"wysyłka\s+od|wysylka\s+od", line, re.IGNORECASE):
 continue
 
     match = PRICE_RE.search(line)
@@ -418,11 +372,6 @@ continue
 return "Nie odczytano; potwierdzić dla 16 szt. do Łęknicy"
 
 def fetch_text(url):
-"""
-Jina Reader zwraca tekst strony.
-Błąd HTTP lub sieci jest zgłaszany, a nie interpretowany
-jako brak produktu.
-"""
 reader_url = "https://r.jina.ai/" + url
 
 headers = {}
@@ -443,20 +392,11 @@ if not response.text.strip():
 
 return response.text, response.status_code, response.url
 
-# ------------------------------------------------------------
-
-# OFERTY BEZPOŚREDNIE
-
-# ------------------------------------------------------------
-
 def parse_direct(text, model, info, shop, url, checked_at):
 if not exact_model_match(text, info):
 return None, "nie znaleziono dokładnego kodu modelu"
 
-# Cena, stan i wysyłka są wyszukiwane w pobliżu
-# wystąpienia konkretnego kodu modelu.
 context = model_context(text, info)
-
 price = explicit_gross_price(context)
 
 if price is None:
@@ -483,12 +423,6 @@ return {
     "stale_note": "",
 }, "dokładny model i jawna cena brutto"
 
-# ------------------------------------------------------------
-
-# COMPAREPV — WYŁĄCZNIE ŹRÓDŁO ODKRYWCZE
-
-# -----------------------------------------------------------
-
 KNOWN_SHOPS = [
 "Megawat Elektrohurt",
 "PVhurt",
@@ -503,10 +437,6 @@ KNOWN_SHOPS = [
 ]
 
 def parse_comparepv(text, model, info, checked_at):
-"""
-Ceny ComparePV są wyłącznie odkrywcze.
-Nie oznaczamy ich jako potwierdzonych cen brutto.
-"""
 results = []
 lines = (text or "").splitlines()
 
@@ -532,7 +462,6 @@ for index, line in enumerate(lines):
     if not shop:
         continue
 
-    # Szukaj ceny w krótkim fragmencie tabeli.
     matches = list(PRICE_RE.finditer(context))
     if not matches:
         continue
@@ -577,12 +506,6 @@ for row in results:
 
 return list(unique.values())
 
-# ------------------------------------------------------------
-
-# HISTORIA I AKTUALNE OFERTY
-
-# ------------------------------------------------------------
-
 def identity(row):
 return (
 row.get("model", ""),
@@ -592,10 +515,6 @@ row.get("source_url", ""),
 )
 
 def mark_stale(row, checked_at, reason):
-"""
-Nie zmieniaj daty ostatniego rzeczywistego odczytu ceny.
-Dopisz wyłącznie informację o nieudanym odświeżeniu.
-"""
 result = dict(row)
 
 old_note = (result.get("stale_note") or "").strip()
@@ -627,8 +546,6 @@ for model, info in PANELS.items():
     log(f"\n=== {model} ===")
 
     for shop, template in DIRECT_SOURCES:
-        # Dla produktu Megawat użyj dokładnego adresu strony,
-        # jeśli został skonfigurowany w PRODUCT_URLS.
         product_url = PRODUCT_URLS.get((model, shop))
 
         if product_url:
@@ -704,8 +621,6 @@ for model, info in PANELS.items():
                 f"{type(exc).__name__}: {exc}"
             )
 
-    # Alert potwierdzony tylko dla bezpośredniej oferty
-    # z jawnie oznaczoną ceną brutto.
     threshold = info.get("alert")
 
     if threshold is not None:
@@ -731,8 +646,6 @@ for model, info in PANELS.items():
                     f"(próg {threshold:.2f} PLN)"
                 )
 
-# Aktualne rekordy: świeże wyniki plus stare rekordy,
-# których nie udało się zweryfikować ponownie.
 current_by_identity = {}
 
 for row in fresh_rows:
@@ -792,11 +705,9 @@ for old in old_prices:
 
 current_rows = list(current_by_identity.values())
 
-# Zachowaj dodatkowe kolumny z istniejącego prices.csv.
 price_fields = csv_fields(FIELDS, old_prices)
 atomic_write_csv(PRICES_FILE, price_fields, current_rows)
 
-# Historia jest dopisywana. Nie usuwamy poprzednich wpisów.
 history_rows = list(old_history)
 history_rows.extend(history_additions)
 
