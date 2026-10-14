@@ -85,15 +85,38 @@ SESSION.headers.update({
     "Accept": "text/plain, text/markdown;q=0.9, */*;q=0.8",
 })
 
-# Source search URLs. They are discovery endpoints, not purchase confirmation.
-def source_urls(term: str) -> list[tuple[str, str, str]]:
+# Known exact product pages are tried before general search pages. These URLs are
+# verified candidates for the main JA Solar panel; the generic search remains a
+# fallback and is used for other tracked models. Direct URLs are still parsed and
+# validated: a URL alone never makes a price accepted.
+DIRECT_PRODUCT_URLS = {
+    "JA Solar JAM54D40-465/LB_BFT": [
+        ("Megawat Elektrohurt", "direct_shop", "https://megawat-elektrohurt.pl/p/2153/5488571/panel-pv-465wp-ja-solar-jam54d40-465-lb-bft-n-type-bifacial-transparent-czarna-rama-panele-fotowoltaiczne-bifacial-panele-pv-fotowoltaika.html"),
+        ("PVHurt", "direct_shop", "https://pvhurt.pl/produkt/ja-solar-465w-jam54d40-465-lb-bf/"),
+        ("Allegro", "marketplace", "https://allegro.pl/oferta/panel-fotowoltaiczny-ja-solar-jam54d40-465-lb-bft-bifacial-dual-glass-465w-18488663937"),
+    ],
+}
+
+# Search URLs are discovery endpoints, not purchase confirmation. A direct product
+# page is tried first where known, followed by a general search page.
+def source_urls(model: str, term: str) -> list[tuple[str, str, str]]:
     q = quote(term)
-    return [
-        ("Megawat Elektrohurt", "direct_shop", f"https://megawat-elektrohurt.pl/?s={q}&post_type=product"),
-        ("PVHurt", "direct_shop", f"https://pvhurt.pl/?s={q}"),
-        ("PVsklep", "direct_shop", f"https://pvsklep.pl/?s={q}"),
-        ("Allegro", "marketplace", f"https://allegro.pl/listing?string={q}"),
-    ]
+    searches = {
+        "Megawat Elektrohurt": ("direct_shop", f"https://megawat-elektrohurt.pl/?s={q}&post_type=product"),
+        "PVHurt": ("direct_shop", f"https://pvhurt.pl/?s={q}"),
+        "PVsklep": ("direct_shop", f"https://pvsklep.pl/?s={q}"),
+        "Allegro": ("marketplace", f"https://allegro.pl/listing?string={q}"),
+    }
+    direct = DIRECT_PRODUCT_URLS.get(model, [])
+    direct_shops = {shop for shop, _, _ in direct}
+    result = list(direct)
+    result.extend((shop, source_type, url) for shop, (source_type, url) in searches.items() if shop not in direct_shops)
+    # For shops with a direct page, also try search as fallback. Keep a unique
+    # URL per source; duplicate observations are collapsed later.
+    for shop, (source_type, url) in searches.items():
+        if shop in direct_shops:
+            result.append((shop, source_type, url))
+    return result
 
 
 def clean(text: object) -> str:
@@ -150,7 +173,12 @@ def price_in_context(text: str, source_type: str) -> tuple[float, str, str] | No
             continue
         currency = m.group(2).upper()
         currency = {"ZŁ": "PLN", "€": "EUR", "$": "USD"}.get(currency, currency)
-        around = text[max(0, m.start()-35):min(len(text), m.end()+45)].lower()
+        # Keep VAT wording local to this price. A wide window can incorrectly
+        # label a net price as gross when the page lists net and gross prices
+        # next to each other.
+        left = text[max(0, m.start()-22):m.start()].lower()
+        right = text[m.end():min(len(text), m.end()+22)].lower()
+        around = left + " " + right
         if re.search(r"\bbrutto\b|gross", around):
             matches.append((value, currency, "gross_explicit"))
         elif re.search(r"\bnetto\b|\bnet\b", around):
@@ -374,7 +402,7 @@ def main() -> None:
     for model, cfg in TRACKED_PANELS.items():
         model_rows: list[dict] = []
         # Direct sellers and marketplace: exact SKU search.
-        for shop, source_type, url in source_urls(cfg["search"]):
+        for shop, source_type, url in source_urls(model, cfg["search"]):
             try:
                 body = get_reader_text(url)
                 rows = parse_search_page(body, model, cfg["search"], shop, source_type, url)
