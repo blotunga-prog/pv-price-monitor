@@ -53,6 +53,28 @@ PRODUCT_URLS = {
         "n-type-bifacial-transparent-czarna-rama-"
         "panele-fotowoltaiczne-bifacial-panele-pv-fotowoltaika.html"
     ),
+    (
+        "JA Solar JAM54D40-465/LR",
+        "pvsklep.pl",
+    ): (
+        "https://pvsklep.pl/produkt/ja-solar-465w-jam54d40-lr-bf-bifacial/"
+    ),
+    (
+        "JA Solar JAM54D40-465/LB_BFT",
+        "Allegro",
+    ): (
+        "https://allegro.pl/oferta/panel-fotowoltaiczny-465w-ja-solar-"
+        "jam54d40-465-lb-bft-bifacial-czarna-rama-18465657093"
+    ),
+    (
+        "JA Solar JAM54D40-465/LR",
+        "Megawat Elektrohurt",
+    ): (
+        "https://megawat-elektrohurt.pl/p/2153/5488572/"
+        "panel-pv-465wp-ja-solar-jam54d40-465-lr-bf-n-type-"
+        "monofacial-czarna-rama-panele-fotowoltaiczne-"
+        "bifacial-panele-pv-fotowoltaika.html"
+    ),
 }
 
 PANELS = {
