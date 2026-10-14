@@ -1,4 +1,3 @@
-
 import csv
 import os
 import re
@@ -6,7 +5,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 from html import unescape
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs
 
 import requests
 
@@ -80,13 +79,13 @@ FIELDNAMES = [
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "PV-Price-Monitor/1.0",
+    "User-Agent": "PV-Price-Monitor/1.1",
     "Accept": "text/plain, text/markdown;q=0.9, */*;q=0.8",
 })
 
 
 def clean_markdown(text):
-    text = unescape(text.strip())
+    text = unescape(str(text).strip())
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"<[^>]+>", "", text)
     text = text.replace("**", "").replace("__", "")
@@ -94,12 +93,12 @@ def clean_markdown(text):
 
 
 def normalize_model(text):
-    return re.sub(r"[^A-Z0-9]", "", text.upper())
+    return re.sub(r"[^A-Z0-9]", "", str(text).upper())
 
 
 def is_poland(country):
-    """Accept only offers explicitly identified as Polish."""
-    value = clean_markdown(str(country)).strip().lower()
+    """Akceptuj wyłącznie oferty jawnie oznaczone jako polskie."""
+    value = clean_markdown(country).strip().lower()
 
     if value in {"pl", "pol", "poland", "polska"}:
         return True
@@ -114,8 +113,10 @@ def is_poland(country):
 def parse_price(text):
     text = clean_markdown(text)
 
+    # Bez końcowego \b, ponieważ symbole €, $ i £ nie są
+    # znakami słowa i mogłyby przez to nie zostać rozpoznane.
     match = re.search(
-        r"([0-9][0-9\s.,]*)\s*(zł|PLN|EUR|€|USD|\$|GBP|£)\b",
+        r"([0-9][0-9\s.,]*)\s*(zł|PLN|EUR|€|USD|\$|GBP|£)",
         text,
         re.I,
     )
@@ -236,10 +237,12 @@ def parse_tables(markdown, source_url):
             else None
         )
 
-        # Without a country column, accept data only from a URL
-        # explicitly filtered to Poland.
+        # Bez kolumny Country akceptujemy wyłącznie stronę,
+        # której adres jawnie filtruje wyniki do Polski.
         if country_idx is None and not country_filter_applied:
             continue
+
+        table_offers = []
 
         for row_line in lines[i + 2:]:
             cells = split_md_row(row_line)
@@ -261,15 +264,15 @@ def parse_tables(markdown, source_url):
             else:
                 country = "Poland"
 
-            # For a search page, verify the product name when
-            # ComparePV supplies a Product column.
+            # Dla strony wyszukiwania sprawdzamy zgodność modelu,
+            # jeśli ComparePV udostępnia kolumnę Product.
             if normalized_search and product_idx is not None:
                 product = clean_markdown(cells[product_idx])
 
                 if normalized_search not in normalize_model(product):
                     continue
 
-            offers.append({
+            table_offers.append({
                 "shop": shop,
                 "country": country,
                 "price": price,
@@ -278,15 +281,15 @@ def parse_tables(markdown, source_url):
                 "updated": clean_markdown(cells[updated_idx]),
             })
 
-        if offers:
-            return offers
+        if table_offers:
+            return table_offers
 
     return offers
 
 
 def fetch_panel(panel_name, source_url):
-    # Encode the target URL so its query parameters are sent
-    # to ComparePV rather than interpreted as Jina parameters.
+    # Parametry docelowego adresu pozostają częścią adresu
+    # przekazanego do Jina Reader.
     jina_url = JINA_PREFIX + source_url
 
     api_key = os.getenv("JINA_API_KEY")
@@ -303,39 +306,45 @@ def fetch_panel(panel_name, source_url):
 
     if response.status_code == 401:
         raise RuntimeError(
-            "Jina Reader HTTP 401. Check JINA_API_KEY "
-            "in GitHub Actions secrets."
+            "Jina Reader HTTP 401. Sprawdź JINA_API_KEY "
+            "w GitHub Actions secrets."
         )
 
     response.raise_for_status()
     text = response.text
-    
-    if "TSM-465NEG9R.28" in source_url:
-        print("DEBUG TRINA RESPONSE:")
-        print(text[:1500])
+
+    # Diagnostykę Triny włączaj tylko na czas sprawdzania błędu.
+    if os.getenv("DEBUG_TRINA", "").lower() in {
+        "1", "true", "yes"
+    }:
+        if "TSM-465NEG9R.28" in source_url:
+            print("DEBUG TRINA RESPONSE:")
+            print(text[:1500])
 
     if len(text) < 100:
         raise RuntimeError(
-            f"Jina returned an unexpectedly short response: "
-            f"{len(text)} bytes."
+            "Odpowiedź Jina jest podejrzanie krótka: "
+            f"{len(text)} bajtów."
         )
 
     offers = parse_tables(text, source_url)
 
     if not offers:
         raise RuntimeError(
-            f"No Polish offers table parsed. "
-            f"Response length={len(text)}."
+            "Nie udało się odczytać tabeli polskich ofert. "
+            f"Długość odpowiedzi: {len(text)}."
         )
 
-    # Final safety check before any offer leaves this function.
+    # Ostateczna kontrola kraju przed zwróceniem ofert.
     offers = [
         offer for offer in offers
         if is_poland(offer["country"])
     ]
 
     if not offers:
-        raise RuntimeError("No offers explicitly identified as Polish.")
+        raise RuntimeError(
+            "Nie znaleziono ofert jawnie oznaczonych jako polskie."
+        )
 
     return offers
 
@@ -349,31 +358,32 @@ def load_csv(path):
 
         if reader.fieldnames != FIELDNAMES:
             raise RuntimeError(
-                f"Unexpected CSV header in {path}. "
-                "The file was not modified."
+                f"Nieoczekiwany nagłówek CSV w {path}. "
+                "Plik nie został zmodyfikowany."
             )
 
         return list(reader)
 
 
+def row_key(row):
+    return (
+        row.get("model", ""),
+        row.get("shop", ""),
+        row.get("currency", ""),
+    )
+
+
 def load_previous_prices():
-    rows = load_csv(CSV_PATH)
     previous = {}
 
-    for row in rows:
+    for row in load_csv(CSV_PATH):
         if not is_poland(row.get("country", "")):
             continue
 
-        key = (
-            row.get("model", ""),
-            row.get("shop", ""),
-            row.get("currency", ""),
-        )
-
         try:
-            previous[key] = float(row["price"])
+            previous[row_key(row)] = float(row["price"])
         except (ValueError, TypeError, KeyError):
-            pass
+            continue
 
     return previous
 
@@ -389,8 +399,13 @@ def write_csv_temp(path, rows):
     )
 
     try:
-        with os.fdopen(fd, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
+        with os.fdopen(
+            fd, "w", newline="", encoding="utf-8"
+        ) as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=FIELDNAMES,
+            )
             writer.writeheader()
             writer.writerows(rows)
 
@@ -406,32 +421,37 @@ def write_csv_temp(path, rows):
 
 def main():
     try:
+        old_current_rows = [
+            row for row in load_csv(CSV_PATH)
+            if is_poland(row.get("country", ""))
+        ]
         previous = load_previous_prices()
+
     except Exception as exc:
-        print(f"ERROR: could not read current prices: {exc}")
+        print(f"ERROR: nie można odczytać bieżących cen: {exc}")
         raise SystemExit(2)
 
     checked_at = datetime.now(timezone.utc).isoformat(
         timespec="seconds"
     )
 
-    current_rows = []
-    total_offers = 0
+    successful_rows_by_model = {}
     successful_models = 0
     failed_models = 0
+    total_offers = 0
 
     for model, cfg in TRACKED_PANELS.items():
         try:
             offers = fetch_panel(model, cfg["url"])
 
             if not offers:
-                raise RuntimeError("No Polish offers returned.")
+                raise RuntimeError(
+                    "Nie zwrócono polskich ofert."
+                )
 
-            successful_models += 1
-            total_offers += len(offers)
+            model_rows = []
 
             for offer in offers:
-                # Defence in depth: never write a non-Polish row.
                 if not is_poland(offer.get("country", "")):
                     print(
                         f"SKIP non-Polish offer: {model} / "
@@ -452,9 +472,9 @@ def main():
                     "source_url": cfg["url"],
                 }
 
-                current_rows.append(row)
+                model_rows.append(row)
 
-                key = (model, offer["shop"], offer["currency"])
+                key = row_key(row)
                 old_price = previous.get(key)
 
                 if (
@@ -462,12 +482,17 @@ def main():
                     and abs(old_price - offer["price"]) >= 0.01
                 ):
                     direction = (
-                        "DOWN" if offer["price"] < old_price else "UP"
+                        "DOWN"
+                        if offer["price"] < old_price
+                        else "UP"
                     )
+
                     print(
                         f"PRICE {direction}: {model} / "
-                        f"{offer['shop']}: {old_price:.2f} -> "
-                        f"{offer['price']:.2f} {offer['currency']}"
+                        f"{offer['shop']}: "
+                        f"{old_price:.2f} -> "
+                        f"{offer['price']:.2f} "
+                        f"{offer['currency']}"
                     )
 
                 alert_pln = cfg.get("alert_pln")
@@ -483,26 +508,36 @@ def main():
                         f"<= {alert_pln:.2f} PLN"
                     )
 
-            model_rows = [
-                row for row in current_rows
-                if row["model"] == model
-            ]
+            if not model_rows:
+                raise RuntimeError(
+                    "Brak prawidłowych polskich ofert "
+                    "po sprawdzeniu danych."
+                )
+
+            successful_rows_by_model[model] = model_rows
+            successful_models += 1
+            total_offers += len(model_rows)
+
             pln_rows = [
                 row for row in model_rows
                 if row["currency"] == "PLN"
             ]
 
             if pln_rows:
-                cheapest = min(pln_rows, key=lambda x: float(x["price"]))
+                cheapest = min(
+                    pln_rows,
+                    key=lambda row: float(row["price"]),
+                )
+
                 print(
-                    f"OK: {model}: {len(model_rows)} Polish offers; "
-                    f"cheapest PLN {float(cheapest['price']):.2f} "
-                    f"at {cheapest['shop']}"
+                    f"OK: {model}: {len(model_rows)} polskich ofert; "
+                    f"najniższa cena {float(cheapest['price']):.2f} PLN "
+                    f"w sklepie {cheapest['shop']}"
                 )
             else:
                 print(
-                    f"OK: {model}: {len(model_rows)} Polish offers; "
-                    "no PLN offer to compare."
+                    f"OK: {model}: {len(model_rows)} polskich ofert; "
+                    "brak oferty w PLN do porównania."
                 )
 
         except Exception as exc:
@@ -510,37 +545,73 @@ def main():
             print(f"ERROR: {model}: {exc}")
 
     print(
-        f"Collection finished: {successful_models}/"
-        f"{len(TRACKED_PANELS)} models successful; "
-        f"{failed_models} failed."
+        f"Zbieranie zakończone: {successful_models}/"
+        f"{len(TRACKED_PANELS)} modeli pobranych poprawnie; "
+        f"błędy: {failed_models}."
     )
 
-    if not current_rows:
-        print("ERROR: zero Polish offers collected. CSV files unchanged.")
+    if successful_models == 0:
+        print(
+            "ERROR: nie pobrano poprawnie żadnego modelu. "
+            "Pliki CSV pozostają bez zmian."
+        )
         raise SystemExit(2)
+
+    # BIEŻĄCE CENY:
+    # - modele pobrane poprawnie zastępujemy świeżymi danymi;
+    # - dla modeli z błędem zachowujemy ostatnie znane oferty;
+    # - stary checked_at_utc pozwala rozpoznać dane nieodświeżone.
+    updated_current = []
+
+    for row in old_current_rows:
+        model = row.get("model", "")
+
+        if (
+            model in TRACKED_PANELS
+            and model not in successful_rows_by_model
+        ):
+            updated_current.append(row)
+
+    for model in TRACKED_PANELS:
+        updated_current.extend(
+            successful_rows_by_model.get(model, [])
+        )
 
     try:
         history_rows = load_csv(HISTORY_PATH)
+
     except Exception as exc:
-        print(f"ERROR: could not read price history: {exc}")
+        print(f"ERROR: nie można odczytać historii cen: {exc}")
         raise SystemExit(2)
 
-    # Remove old records that are foreign or whose country is unknown.
-    # Keep only records explicitly identified as Poland.
+    # HISTORIA:
+    # zachowujemy dotychczasowe polskie rekordy i dopisujemy
+    # tylko oferty pobrane oraz zweryfikowane w tym uruchomieniu.
     clean_history = [
         row for row in history_rows
         if is_poland(row.get("country", ""))
     ]
 
-    # New records are labelled Poland only after passing the checks above.
-    updated_history = clean_history + current_rows
+    new_history = [
+        row
+        for model in TRACKED_PANELS
+        for row in successful_rows_by_model.get(model, [])
+    ]
+
+    updated_history = clean_history + new_history
 
     temp_current = None
     temp_history = None
 
     try:
-        temp_current = write_csv_temp(CSV_PATH, current_rows)
-        temp_history = write_csv_temp(HISTORY_PATH, updated_history)
+        temp_current = write_csv_temp(
+            CSV_PATH,
+            updated_current,
+        )
+        temp_history = write_csv_temp(
+            HISTORY_PATH,
+            updated_history,
+        )
 
         os.replace(temp_current, CSV_PATH)
         temp_current = None
@@ -549,7 +620,7 @@ def main():
         temp_history = None
 
     except Exception as exc:
-        print(f"ERROR: could not save CSV files: {exc}")
+        print(f"ERROR: nie udało się zapisać plików CSV: {exc}")
         raise SystemExit(2)
 
     finally:
@@ -562,19 +633,47 @@ def main():
 
     removed_history = len(history_rows) - len(clean_history)
 
-    print(f"Saved {len(current_rows)} Polish offers to {CSV_PATH}.")
-    print(
-        f"History contains {len(updated_history)} Polish records "
-        f"in {HISTORY_PATH}."
-    )
-    print(f"Removed {removed_history} non-Polish/unknown history records.")
-    print(f"Total Polish offers parsed: {total_offers}")
-    print(
-        f"Models successful: {successful_models}/"
-        f"{len(TRACKED_PANELS)}"
-    )
-    print(f"Models failed: {failed_models}")
+    retained_stale_models = sorted({
+        row.get("model", "")
+        for row in updated_current
+        if row.get("model") in TRACKED_PANELS
+        and row.get("model") not in successful_rows_by_model
+    })
 
+    print(
+        f"Zapisano {len(updated_current)} ofert w {CSV_PATH}."
+    )
+    print(
+        f"Historia zawiera {len(updated_history)} polskich "
+        f"rekordów w {HISTORY_PATH}."
+    )
+    print(
+        f"Usunięto {removed_history} zagranicznych lub "
+        "niezweryfikowanych rekordów historii."
+    )
+    print(
+        f"Nowe rekordy historii: {len(new_history)}."
+    )
+    print(
+        f"Łącznie pobranych świeżych polskich ofert: "
+        f"{total_offers}."
+    )
+    print(
+        f"Modele pobrane poprawnie: "
+        f"{successful_models}/{len(TRACKED_PANELS)}."
+    )
+    print(f"Modele z błędem: {failed_models}.")
+
+    if retained_stale_models:
+        print(
+            "WARNING: zachowano ostatnie znane oferty "
+            "dla modeli, których nie udało się odświeżyć. "
+            "Sprawdź checked_at_utc przed uznaniem ich za aktualne: "
+            + ", ".join(retained_stale_models)
+        )
+
+    # Zachowujemy niezerowy kod wyjścia przy błędzie modelu,
+    # aby GitHub Actions nadal sygnalizował niepełne pobranie.
     if failed_models:
         raise SystemExit(2)
 
