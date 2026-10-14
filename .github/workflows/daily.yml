@@ -1,16 +1,26 @@
 
 name: Daily PV price monitor
 
-"on":
+on:
   workflow_dispatch: {}
+
   push:
     branches:
       - main
+    paths:
+      - "monitor.py"
+      - "requirements.txt"
+      - ".github/workflows/**"
+
   schedule:
     - cron: "0 5 * * *"
 
 permissions:
   contents: write
+
+concurrency:
+  group: pv-price-monitor
+  cancel-in-progress: false
 
 jobs:
   monitor:
@@ -19,6 +29,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,14 +41,14 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Run ComparePV monitor
-        continue-on-error: true
+      - name: Run PV price monitor
+        id: monitor
         env:
           JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
         run: python monitor.py
 
-      - name: Commit price history
-        if: always()
+      - name: Commit price data
+        if: always() && steps.monitor.outcome != 'cancelled'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
