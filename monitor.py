@@ -1,485 +1,708 @@
 #!/usr/bin/env python3
-"""PV price monitor: Polish offers from direct shops, Allegro and ComparePV.
-
-Uses requests + Jina Reader (no HTML parser dependency). Search results are treated
-as candidates only; exact model-token checks and price-basis checks are applied
-before a row is accepted. A fetch/parse error never means out-of-stock.
-"""
-from __future__ import annotations
-
 import csv
 import os
 import re
+import sys
 import tempfile
 from datetime import datetime, timezone
-from html import unescape
 from pathlib import Path
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import quote
 
 import requests
 
-# Keep exact catalog symbols here. Do not remove suffixes such as _BFT, _BF or -BDV.
-TRACKED_PANELS = {
+
+# ------------------------------------------------------------
+# KONFIGURACJA
+# ------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+PRICES_FILE = DATA_DIR / "prices.csv"
+HISTORY_FILE = DATA_DIR / "price_history.csv"
+
+FIELDS = [
+    "checked_at_utc",
+    "model",
+    "shop",
+    "country",
+    "price",
+    "currency",
+    "vat",
+    "stock",
+    "updated",
+    "source_url",
+    "source_type",
+    "price_basis",
+    "qty16_cost_pln",
+    "shipping",
+    "stale_note",
+]
+
+DIRECT_SOURCES = [
+    (
+        "Megawat Elektrohurt",
+        "https://megawat-elektrohurt.pl/?s={q}&post_type=product",
+    ),
+    ("PVhurt", "https://pvhurt.pl/?s={q}"),
+    ("pvsklep.pl", "https://pvsklep.pl/?s={q}"),
+    ("Allegro", "https://allegro.pl/listing?string={q}"),
+]
+
+# Progi alertów pozostają bez zmian.
+# None oznacza, że próg nie został ustalony.
+PANELS = {
     "JA Solar JAM54D40-465/LB_BFT": {
-        "compare_url": "https://comparepv.com/panel/ja-solar-jam54d40-465-lb",
-        "search": "JAM54D40-465/LB_BFT", "alert_pln": 340.0,
+        "search": "JAM54D40-465/LB_BFT",
+        "aliases": ["JAM54D40-465/LB_BFT"],
+        "compare": "https://comparepv.com/panel/ja-solar-jam54d40-465-lb",
+        "alert": 340.00,
     },
     "JA Solar JAM54D40-465/LR": {
-        "compare_url": "https://comparepv.com/panel/ja-solar-jam54d40-465-lr",
-        "search": "JAM54D40-465/LR", "alert_pln": 325.0,
+        "search": "JAM54D40-465/LR",
+        "aliases": ["JAM54D40-465/LR"],
+        "compare": "https://comparepv.com/panel/ja-solar-jam54d40-465-lr",
+        "alert": 325.00,
     },
     "JA Solar JAM54D40-460/LB": {
-        "compare_url": "https://comparepv.com/panel/ja-solar-jam54d40-460-lb-1",
-        "search": "JAM54D40-460/LB", "alert_pln": 315.0,
+        "search": "JAM54D40-460/LB",
+        "aliases": ["JAM54D40-460/LB"],
+        "compare": "https://comparepv.com/panel/ja-solar-jam54d40-460-lb-1",
+        "alert": 315.00,
     },
     "JA Solar JAM54D40-460/LR": {
-        "compare_url": "https://comparepv.com/panel/ja-solar-jam54d40-460-lr",
-        "search": "JAM54D40-460/LR", "alert_pln": 315.0,
+        "search": "JAM54D40-460/LR",
+        "aliases": ["JAM54D40-460/LR"],
+        "compare": "https://comparepv.com/panel/ja-solar-jam54d40-460-lr",
+        "alert": 315.00,
     },
     "AIKO-A470-MCE54Mw": {
-        "compare_url": "https://comparepv.com/panel/aiko-aiko-a470-mce54mw",
-        "search": "AIKO-A470-MCE54Mw", "alert_pln": None,
+        "search": "AIKO-A470-MCE54Mw",
+        "aliases": ["A470-MCE54Mw"],
+        "compare": None,
+        "alert": None,
     },
     "AIKO-A475-MCE54Mw": {
-        "compare_url": "https://comparepv.com/panel/aiko-aiko-a475-mce54mw",
-        "search": "AIKO-A475-MCE54Mw", "alert_pln": None,
+        "search": "AIKO-A475-MCE54Mw",
+        "aliases": ["A475-MCE54Mw"],
+        "compare": None,
+        "alert": None,
     },
     "AIKO-A485-MCE54Mw": {
-        "compare_url": "https://comparepv.com/panel/aiko-aiko-a485-mce54mw",
-        "search": "AIKO-A485-MCE54Mw", "alert_pln": None,
+        "search": "AIKO-A485-MCE54Mw",
+        "aliases": ["A485-MCE54Mw"],
+        "compare": None,
+        "alert": None,
     },
     "Trina Solar TSM-465NEG9R.28": {
-        "compare_url": "https://comparepv.com/offers?country=PL&q=TSM-465NEG9R.28",
-        "search": "TSM-465NEG9R.28", "alert_pln": None,
+        "search": "TSM-465NEG9R.28",
+        "aliases": ["TSM-465NEG9R.28"],
+        "compare": None,
+        "alert": None,
     },
-    # This is the broad family code in the existing monitor. Exact matching is
-    # deliberately strict; update this key when the exact Jinko SKU is chosen.
+    # To nadal kandydat z szerokiej rodziny Jinko.
+    # Nie utożsamiamy go z innymi wariantami DB/BDV.
     "Jinko Solar JKM450-475N-48HL4M-DB-Z2-EN (465W)": {
-        "compare_url": "https://comparepv.com/panel/jinkosolar-jkm450-475n-48hl4m-db-z2-en-465w",
-        "search": "JKM450-475N-48HL4M-DB-Z2-EN", "alert_pln": None,
+        "search": "JKM450-475N-48HL4M-DB-Z2-EN",
+        "aliases": ["JKM450-475N-48HL4M-DB-Z2-EN"],
+        "compare": None,
+        "alert": None,
     },
     "LONGi LR7-54HTH-465M": {
-        "compare_url": "https://comparepv.com/panel/longi-lr7-54hth-465m",
-        "search": "LR7-54HTH-465M", "alert_pln": None,
+        "search": "LR7-54HTH-465M",
+        "aliases": ["LR7-54HTH-465M"],
+        "compare": "https://comparepv.com/panel/longi-lr7-54hth-465m",
+        "alert": None,
     },
 }
 
-CSV_PATH = Path("data/prices.csv")
-HISTORY_PATH = Path("data/price_history.csv")
-JINA_PREFIX = "https://r.jina.ai/"
-QTY_TARGET = 16
-VAT_RATE = 0.23
-
-# New columns are appended to the previous schema. Existing CSV files are migrated
-# on read, preserving old rows and their timestamps.
-FIELDNAMES = [
-    "checked_at_utc", "model", "shop", "country", "price", "currency",
-    "vat", "stock", "updated", "source_url", "source_type",
-    "price_basis", "qty16_cost_pln", "shipping", "stale_note",
-]
-OLD_FIELDNAMES = FIELDNAMES[:10]
-
+TIMEOUT = 30
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; PV-Price-Monitor/2.0; +https://github.com/blotunga-prog/pv-price-monitor)",
-    "Accept": "text/plain, text/markdown;q=0.9, */*;q=0.8",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 Chrome/125.0 Safari/537.36"
+    ),
+    "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.7",
 })
 
-# Known exact product pages are tried before general search pages. These URLs are
-# verified candidates for the main JA Solar panel; the generic search remains a
-# fallback and is used for other tracked models. Direct URLs are still parsed and
-# validated: a URL alone never makes a price accepted.
-DIRECT_PRODUCT_URLS = {
-    "JA Solar JAM54D40-465/LB_BFT": [
-        ("Megawat Elektrohurt", "direct_shop", "https://megawat-elektrohurt.pl/p/2153/5488571/panel-pv-465wp-ja-solar-jam54d40-465-lb-bft-n-type-bifacial-transparent-czarna-rama-panele-fotowoltaiczne-bifacial-panele-pv-fotowoltaika.html"),
-        ("PVHurt", "direct_shop", "https://pvhurt.pl/produkt/ja-solar-465w-jam54d40-465-lb-bf/"),
-        ("Allegro", "marketplace", "https://allegro.pl/oferta/panel-fotowoltaiczny-ja-solar-jam54d40-465-lb-bft-bifacial-dual-glass-465w-18488663937"),
-    ],
-}
 
-# Search URLs are discovery endpoints, not purchase confirmation. A direct product
-# page is tried first where known, followed by a general search page.
-def source_urls(model: str, term: str) -> list[tuple[str, str, str]]:
-    q = quote(term)
-    searches = {
-        "Megawat Elektrohurt": ("direct_shop", f"https://megawat-elektrohurt.pl/?s={q}&post_type=product"),
-        "PVHurt": ("direct_shop", f"https://pvhurt.pl/?s={q}"),
-        "PVsklep": ("direct_shop", f"https://pvsklep.pl/?s={q}"),
-        "Allegro": ("marketplace", f"https://allegro.pl/listing?string={q}"),
-    }
-    direct = DIRECT_PRODUCT_URLS.get(model, [])
-    direct_shops = {shop for shop, _, _ in direct}
-    result = list(direct)
-    result.extend((shop, source_type, url) for shop, (source_type, url) in searches.items() if shop not in direct_shops)
-    # For shops with a direct page, also try search as fallback. Keep a unique
-    # URL per source; duplicate observations are collapsed later.
-    for shop, (source_type, url) in searches.items():
-        if shop in direct_shops:
-            result.append((shop, source_type, url))
-    return result
+# ------------------------------------------------------------
+# NARZĘDZIA
+# ------------------------------------------------------------
+
+def log(message):
+    print(message, flush=True)
 
 
-def clean(text: object) -> str:
-    s = unescape(str(text or "").strip())
-    s = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", s)
-    s = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 \2", s)
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = s.replace("**", "").replace("__", "")
-    return re.sub(r"\s+", " ", s).strip()
+def now_utc():
+    return datetime.now(timezone.utc).replace(
+        microsecond=0
+    ).isoformat()
 
 
-def norm(text: object) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(text or "").upper())
+def norm(value):
+    value = (value or "").replace("\u00a0", " ")
+    value = value.replace("\u202f", " ")
+    return re.sub(r"\s+", " ", value).strip().casefold()
 
 
-def is_poland(text: object) -> bool:
-    s = clean(text).lower()
-    return s in {"pl", "pol", "poland", "polska", "polska (pl)"} or "polska" in s or "poland" in s or "🇵🇱" in s
-
-
-def parse_number(raw: str) -> float | None:
-    s = raw.replace("\u00a0", " ").replace(" ", "")
-    if "," in s and "." in s:
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    elif "," in s:
-        tail = s.rsplit(",", 1)[-1]
-        s = s.replace(",", ".") if len(tail) in (1, 2) else s.replace(",", "")
-    elif s.count(".") > 1:
-        p = s.split(".")
-        s = "".join(p[:-1]) + "." + p[-1]
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-PRICE_RE = re.compile(r"(?<![A-Z0-9])([0-9][0-9\s\u00a0.,]{0,14})\s*(zł|PLN|EUR|€|USD|\$)", re.I)
-
-
-def price_in_context(text: str, source_type: str) -> tuple[float, str, str] | None:
-    """Return (price, currency, basis). Prefer explicitly gross prices.
-
-    Net-only prices are converted to gross at 23% and labelled calculated.
-    Unlabelled prices from consumer Allegro are assumed gross; unlabelled prices
-    from wholesale/search/comparison pages are not accepted as gross.
-    """
-    matches = []
-    for m in PRICE_RE.finditer(text):
-        value = parse_number(m.group(1))
-        if value is None or value <= 0:
-            continue
-        currency = m.group(2).upper()
-        currency = {"ZŁ": "PLN", "€": "EUR", "$": "USD"}.get(currency, currency)
-        # Keep VAT wording local to this price. A wide window can incorrectly
-        # label a net price as gross when the page lists net and gross prices
-        # next to each other.
-        left = text[max(0, m.start()-22):m.start()].lower()
-        right = text[m.end():min(len(text), m.end()+22)].lower()
-        around = left + " " + right
-        if re.search(r"\bbrutto\b|gross", around):
-            matches.append((value, currency, "gross_explicit"))
-        elif re.search(r"\bnetto\b|\bnet\b", around):
-            matches.append((round(value * (1 + VAT_RATE), 2), currency, "gross_calculated_from_net_23pct"))
-        elif source_type == "marketplace" and currency == "PLN":
-            matches.append((value, currency, "gross_assumed_consumer_price"))
-    # Explicit gross wins over converted net; otherwise take the first valid price.
-    for wanted in ("gross_explicit", "gross_calculated_from_net_23pct", "gross_assumed_consumer_price"):
-        for item in matches:
-            if item[2] == wanted:
-                return item
-    return None
-
-
-def get_reader_text(url: str) -> str:
-    headers = {}
-    key = os.getenv("JINA_API_KEY", "").strip()
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    response = SESSION.get(JINA_PREFIX + url, headers=headers, timeout=50)
-    response.raise_for_status()
-    body = response.text
-    if len(body) < 80:
-        raise RuntimeError(f"Za krótka odpowiedź ({len(body)} znaków)")
-    return body
-
-
-def exact_model_match(text: str, search_term: str) -> bool:
-    """Match the complete model token, including its suffix.
-
-    Separators between model chunks may differ (slash, hyphen, underscore or
-    whitespace), but an alphanumeric suffix after the requested SKU is rejected.
-    Thus /LB does not match /LB_BFT and -BDV does not match another suffix.
-    """
-    chunks = re.findall(r"[A-Z0-9]+", search_term.upper())
-    if not chunks:
-        return False
-    pattern = r"(?<![A-Z0-9])" + r"[\s._/\-]*".join(map(re.escape, chunks)) + r"(?![A-Z0-9]|[._/\-][A-Z0-9])"
-    return re.search(pattern, str(text).upper()) is not None
-
-
-def extract_links(text: str) -> list[str]:
-    return re.findall(r"https?://[^\s)\]>]+", text)
-
-
-def guess_stock(text: str) -> str:
-    s = text.lower()
-    if any(x in s for x in ("brak w magazynie", "niedostępny", "wyprzedany", "out of stock", "unavailable")):
-        return "unavailable"
-    m = re.search(r"(?:dostępność|w magazynie|stan magazynowy|available|stock)[^\n]{0,55}", s, re.I)
-    if m:
-        return clean(m.group(0))[:100]
-    if "dostępny" in s or "in stock" in s or "produkt dostępny" in s:
-        return "available (quantity not confirmed)"
-    return "unknown"
-
-
-def parse_search_page(text: str, model: str, search_term: str, shop: str,
-                      source_type: str, source_url: str) -> list[dict]:
-    """Find snippets containing the exact catalog symbol and a nearby price.
-
-    A product card usually occupies several lines in Jina markdown. Candidate
-    snippets are checked independently so one unrelated price elsewhere on the
-    search page cannot be assigned to the requested panel.
-    """
-    lines = text.splitlines()
-    out = []
-    seen = set()
-    for i, line in enumerate(lines):
-        # Look at a short card window; require exact model token in that window.
-        start, end = max(0, i - 1), min(len(lines), i + 7)
-        snippet = "\n".join(lines[start:end])
-        if not exact_model_match(snippet, search_term):
-            continue
-        parsed = price_in_context(clean(snippet), source_type)
-        if not parsed:
-            continue
-        price, currency, basis = parsed
-        # A model name by itself plus a price far away is not enough.
-        if currency != "PLN":
-            continue
-        links = extract_links(snippet)
-        product_url = next((u for u in links if urlparse(u).netloc and not u.startswith(JINA_PREFIX)), source_url)
-        key = (round(price, 2), product_url)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({
-            "model": model,
-            "shop": shop,
-            "country": "Poland",
-            "price": price,
-            "currency": currency,
-            "vat": "23%" if basis == "gross_calculated_from_net_23pct" else ("included/assumed" if basis.startswith("gross") else "unknown"),
-            "stock": guess_stock(snippet),
-            "updated": "not provided by source",
-            "source_url": product_url,
-            "source_type": source_type,
-            "price_basis": basis,
-            "qty16_cost_pln": f"{price * QTY_TARGET:.2f}",
-            "shipping": "not included / verify for Łęknica",
-            "stale_note": "",
-        })
-    return out
-
-
-def parse_comparepv(text: str, model: str, source_url: str) -> list[dict]:
-    """Parse ComparePV tables as discovery only, not purchase-confirmed prices."""
-    rows = []
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if not line.strip().startswith("|"):
-            continue
-        header = [clean(c).lower() for c in line.strip().strip("|").split("|")]
-        if not {"shop", "price", "stock"}.issubset(set(header)):
-            continue
-        if not any("offer updated" in h for h in header):
-            continue
-        if i + 1 >= len(lines) or not re.fullmatch(r"\|?[\s:|\-]+\|?", lines[i+1].strip()):
-            continue
-        idx = {h: header.index(h) for h in header}
-        country_i = idx.get("country")
-        product_i = idx.get("product")
-        for rowline in lines[i+2:]:
-            if not rowline.strip().startswith("|"):
-                break
-            cells = [clean(c) for c in rowline.strip().strip("|").split("|")]
-            if len(cells) != len(header):
-                break
-            country = cells[country_i] if country_i is not None else ("Poland" if parse_qs(urlparse(source_url).query).get("country", [""])[0].upper() == "PL" else "")
-            if not is_poland(country):
-                continue
-            if product_i is not None and not exact_model_match(cells[product_i], TRACKED_PANELS[model]["search"]):
-                continue
-            # ComparePV often does not identify whether the price is gross.
-            price_text = cells[idx["price"]]
-            match = PRICE_RE.search(price_text)
-            if not match:
-                continue
-            price = parse_number(match.group(1))
-            currency = match.group(2).upper()
-            currency = {"ZŁ": "PLN", "€": "EUR", "$": "USD"}.get(currency, currency)
-            if price is None or currency != "PLN":
-                continue
-            basis = "unverified_comparison_price"
-            rows.append({
-                "model": model, "shop": cells[idx["shop"]], "country": "Poland",
-                "price": price, "currency": currency, "vat": "unknown",
-                "stock": cells[idx["stock"]],
-                "updated": cells[idx[next(h for h in header if "offer updated" in h)]],
-                "source_url": source_url, "source_type": "comparison_discovery",
-                "price_basis": "unverified_comparison_price",
-                "qty16_cost_pln": "", "shipping": "not included / verify for Łęknica",
-                "stale_note": "Discovery only: confirm price, VAT, stock and shipping at the seller.",
-            })
-    return rows
-
-
-def load_csv(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    with path.open(newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        rows = []
-        for old in reader:
-            row = {k: (old.get(k) or "") for k in FIELDNAMES}
-            if not row["source_type"]:
-                row["source_type"] = "legacy_comparepv"
-            if not row["price_basis"]:
-                row["price_basis"] = "legacy_basis_unknown"
-            if not row["qty16_cost_pln"]:
-                try:
-                    row["qty16_cost_pln"] = f"{float(row['price']) * QTY_TARGET:.2f}" if row["currency"] == "PLN" else ""
-                except (ValueError, TypeError):
-                    pass
-            rows.append(row)
-        return rows
-
-
-def write_csv_atomic(path: Path, rows: list[dict]) -> None:
+def atomic_write_csv(path, fields, rows):
+    """Zapis atomowy: nie zostawiaj częściowo zapisanego CSV."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent), text=True)
+
+    fd, temp_name = tempfile.mkstemp(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+
     try:
-        with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="ignore")
+        with os.fdopen(
+            fd, "w", newline="", encoding="utf-8-sig"
+        ) as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=fields,
+                extrasaction="ignore",
+            )
             writer.writeheader()
-            writer.writerows(rows)
-        os.replace(tmp, path)
+
+            for row in rows:
+                writer.writerow({
+                    field: row.get(field, "")
+                    for field in fields
+                })
+
+        os.replace(temp_name, path)
+
     except Exception:
         try:
-            os.unlink(tmp)
+            os.unlink(temp_name)
         except OSError:
             pass
         raise
 
 
-def row_key(row: dict) -> tuple[str, str, str, str]:
-    return (row.get("model", ""), row.get("shop", ""), row.get("currency", ""), row.get("source_type", ""))
+def read_csv(path):
+    if not path.exists():
+        return []
+
+    with path.open(
+        "r", newline="", encoding="utf-8-sig"
+    ) as handle:
+        return list(csv.DictReader(handle))
 
 
-def main() -> None:
-    try:
-        old_current = load_csv(CSV_PATH)
-        history = load_csv(HISTORY_PATH)
-    except Exception as exc:
-        print(f"ERROR: nie można odczytać CSV: {exc}")
-        raise SystemExit(2)
+def exact_model_match(text, info):
+    """
+    Dopasowanie pełnego kodu modelu.
+    Usuwamy spacje, ale nie usuwamy znaków /, - ani kropek,
+    które mogą rozróżniać warianty paneli.
+    """
+    haystack = norm(text).replace(" ", "")
 
-    checked = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    previous = {}
-    for row in old_current:
-        try:
-            previous[row_key(row)] = float(row["price"])
-        except (ValueError, TypeError):
-            continue
+    for alias in info["aliases"]:
+        needle = norm(alias).replace(" ", "")
+        if needle and needle in haystack:
+            return True
 
-    fresh_by_model: dict[str, list[dict]] = {}
-    errors: list[str] = []
-    total = 0
+    return False
 
-    for model, cfg in TRACKED_PANELS.items():
-        model_rows: list[dict] = []
-        # Direct sellers and marketplace: exact SKU search.
-        for shop, source_type, url in source_urls(model, cfg["search"]):
-            try:
-                body = get_reader_text(url)
-                rows = parse_search_page(body, model, cfg["search"], shop, source_type, url)
-                model_rows.extend(rows)
-                if rows:
-                    print(f"OK direct: {model} / {shop}: {len(rows)} candidate offer(s)")
-                else:
-                    print(f"INFO: {model} / {shop}: no verified exact-model gross-price match")
-            except Exception as exc:
-                errors.append(f"{model} / {shop}: {exc}")
-                print(f"WARN: {model} / {shop}: {exc}")
-        # ComparePV is discovery only; do not treat these prices as confirmed gross.
-        try:
-            body = get_reader_text(cfg["compare_url"])
-            comparison_rows = parse_comparepv(body, model, cfg["compare_url"])
-            model_rows.extend(comparison_rows)
-            print(f"OK ComparePV: {model}: {len(comparison_rows)} discovery offer(s)")
-        except Exception as exc:
-            errors.append(f"{model} / ComparePV: {exc}")
-            print(f"WARN: {model} / ComparePV: {exc}")
 
-        # De-duplicate identical source/product/price records.
-        unique = {}
-        for row in model_rows:
-            row["checked_at_utc"] = checked
-            unique[(row["shop"], row["source_url"], row["price"], row["source_type"])] = row
-        model_rows = list(unique.values())
-        if model_rows:
-            fresh_by_model[model] = model_rows
-            total += len(model_rows)
-            for row in model_rows:
-                if row["price_basis"] in {"gross_explicit", "gross_calculated_from_net_23pct", "gross_assumed_consumer_price"} and row["currency"] == "PLN":
-                    old = previous.get(row_key(row))
-                    if old is not None and abs(old - float(row["price"])) >= 0.01:
-                        direction = "DOWN" if float(row["price"]) < old else "UP"
-                        print(f"PRICE {direction}: {model} / {row['shop']}: {old:.2f} -> {float(row['price']):.2f} PLN")
-                    threshold = cfg.get("alert_pln")
-                    if threshold is not None and float(row["price"]) <= threshold:
-                        print(f"ALERT: {model} / {row['shop']} = {float(row['price']):.2f} PLN <= {threshold:.2f} PLN")
+def parse_number(raw):
+    raw = re.sub(r"\s+", "", raw.replace("\u00a0", " "))
+
+    if "," in raw and "." in raw:
+        if raw.rfind(",") > raw.rfind("."):
+            raw = raw.replace(".", "").replace(",", ".")
         else:
-            print(f"WARN: {model}: no offers accepted; previous data will be retained as stale")
+            raw = raw.replace(",", "")
+    elif "," in raw:
+        raw = raw.replace(",", ".")
 
-    # Current prices: replace only models with fresh accepted rows. Preserve stale rows
-    # for failed models and explicitly label them stale rather than implying freshness.
-    current = []
-    for row in old_current:
-        model = row.get("model", "")
-        # Current CSV contains only models currently configured. Old model names
-        # remain in price_history.csv, but not as misleading current offers.
-        if model not in TRACKED_PANELS:
-            continue
-        if model not in fresh_by_model:
-            row["stale_note"] = "NOT REFRESHED: last known value; verify before purchase."
-            current.append(row)
-    for model in TRACKED_PANELS:
-        current.extend(fresh_by_model.get(model, []))
-
-    # Keep prior history and append only newly fetched records.
-    new_history = [r for model in TRACKED_PANELS for r in fresh_by_model.get(model, [])]
     try:
-        write_csv_atomic(CSV_PATH, current)
-        write_csv_atomic(HISTORY_PATH, history + new_history)
-    except Exception as exc:
-        print(f"ERROR: zapis CSV nie powiódł się: {exc}")
-        raise SystemExit(2)
+        return float(raw)
+    except ValueError:
+        return None
 
-    print(f"Saved current offers: {len(current)} to {CSV_PATH}")
-    print(f"Added history records: {len(new_history)}; total history: {len(history) + len(new_history)}")
-    print(f"Accepted fresh offers: {total}")
-    print(f"Source errors / no-fetch events: {len(errors)}")
-    if errors:
-        print("Source issues (some can be temporary blocks or no matching offer):")
-        for err in errors[:40]:
-            print(f" - {err}")
-        # Nonzero exit keeps GitHub Actions visibly red while CSV commit step still runs.
-        raise SystemExit(2)
+
+PRICE_RE = re.compile(
+    r"(?<![\w])"
+    r"(\d{1,3}(?:[ .]\d{3})*(?:[,.]\d{2})|"
+    r"\d{2,5}(?:[,.]\d{1,2})?)"
+    r"\s*(?:zł|PLN)\b",
+    re.IGNORECASE,
+)
+
+
+def explicit_gross_price(text):
+    """
+    Akceptuj wyłącznie cenę opisaną jako brutto lub z VAT.
+    Nie przeliczaj automatycznie cen netto na brutto.
+    """
+    lines = (text or "").splitlines()
+
+    for index, line in enumerate(lines):
+        start = max(0, index - 1)
+        end = min(len(lines), index + 2)
+        context = " ".join(lines[start:end])
+        context_norm = norm(context)
+
+        gross = any(label in context_norm for label in (
+            "brutto",
+            "cena z vat",
+            "z vat",
+            "vat wliczony",
+            "including vat",
+            "gross price",
+        ))
+
+        net = any(label in context_norm for label in (
+            "netto",
+            "bez vat",
+            "net price",
+            "excl. vat",
+        ))
+
+        if not gross or net:
+            continue
+
+        for match in PRICE_RE.finditer(context):
+            price = parse_number(match.group(1))
+            if price is not None and 10 <= price <= 10000:
+                return round(price, 2)
+
+    return None
+
+
+def stock_status(text):
+    value = norm(text)
+
+    if any(term in value for term in (
+        "brak w magazynie",
+        "niedostępny",
+        "niedostepny",
+        "out of stock",
+    )):
+        return "Out of stock"
+
+    if any(term in value for term in (
+        "w magazynie",
+        "dostępny",
+        "dostepny",
+        "in stock",
+        "na stanie",
+    )):
+        return "In stock"
+
+    return "Not stated"
+
+
+def fetch_text(url):
+    """
+    Jina Reader zwraca tekst strony.
+    Błąd HTTP lub sieci jest zgłaszany, a nie interpretowany
+    jako brak produktu.
+    """
+    reader_url = "https://r.jina.ai/" + url
+
+    headers = {}
+    api_key = os.getenv("JINA_API_KEY", "").strip()
+
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+
+    response = SESSION.get(
+        reader_url,
+        headers=headers,
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+
+    if not response.text.strip():
+        raise ValueError("Pobrana strona nie zawiera tekstu")
+
+    return response.text, response.status_code, response.url
+
+
+# ------------------------------------------------------------
+# OFERTY BEZPOŚREDNIE
+# ------------------------------------------------------------
+
+def parse_direct(text, model, info, shop, url, checked_at):
+    if not exact_model_match(text, info):
+        return None, "nie znaleziono dokładnego kodu modelu"
+
+    price = explicit_gross_price(text)
+
+    if price is None:
+        return None, (
+            "znaleziono kod modelu, ale nie ma jednoznacznej "
+            "ceny brutto w PLN"
+        )
+
+    return {
+        "checked_at_utc": checked_at,
+        "model": model,
+        "shop": shop,
+        "country": "Poland",
+        "price": f"{price:.2f}",
+        "currency": "PLN",
+        "vat": "gross",
+        "stock": stock_status(text),
+        "updated": "",
+        "source_url": url,
+        "source_type": "direct_store",
+        "price_basis": "explicit_gross_price",
+        "qty16_cost_pln": f"{price * 16:.2f}",
+        "shipping": "not included / verify for Łęknica",
+        "stale_note": "",
+    }, "dokładny model i jawna cena brutto"
+
+
+# ------------------------------------------------------------
+# COMPAREPV — WYŁĄCZNIE ŹRÓDŁO ODKRYWCZE
+# ------------------------------------------------------------
+
+KNOWN_SHOPS = [
+    "Megawat Elektrohurt",
+    "PVhurt",
+    "pvsklep.pl",
+    "Solar-EM",
+    "Solmix",
+    "PV Zenit",
+    "Eco System Projekt",
+    "Solaris Energy",
+    "Sklep Soltech",
+    "Allegro",
+]
+
+
+def parse_comparepv(text, model, info, checked_at):
+    """
+    Ostrożny parser tabeli porównywarki.
+    Jeśli wiersz jest niejednoznaczny, pomija go.
+    Ceny te nigdy nie są oznaczane jako potwierdzone brutto.
+    """
+    results = []
+    lines = (text or "").splitlines()
+
+    for index, line in enumerate(lines):
+        # Bierzemy niewielki fragment wokół wiersza.
+        context = " ".join(
+            lines[max(0, index - 1):min(len(lines), index + 3)]
+        )
+
+        if not re.search(r"(?:PLN|zł)", context, re.IGNORECASE):
+            continue
+
+        shop = next(
+            (
+                name for name in KNOWN_SHOPS
+                if norm(name) in norm(line)
+            ),
+            None,
+        )
+
+        if not shop:
+            continue
+
+        matches = list(PRICE_RE.finditer(line))
+        if not matches:
+            continue
+
+        # Cena musi znajdować się w wierszu z nazwą sklepu.
+        price = parse_number(matches[0].group(1))
+        if price is None or not 10 <= price <= 10000:
+            continue
+
+        # Model musi występować na stronie, a niekoniecznie
+        # w każdym wierszu tabeli.
+        if not exact_model_match(text, info):
+            continue
+
+        updated_match = re.search(
+            r"\b(?:\d+\s*(?:min|minutes?|godz\.?|godzin|h|dni|days)"
+            r"\s*ago|\d{4}-\d{2}-\d{2})\b",
+            context,
+            re.IGNORECASE,
+        )
+
+        results.append({
+            "checked_at_utc": checked_at,
+            "model": model,
+            "shop": shop,
+            "country": "Poland",
+            "price": f"{price:.2f}",
+            "currency": "PLN",
+            "vat": "unknown",
+            "stock": stock_status(context),
+            "updated": (
+                updated_match.group(0) if updated_match else ""
+            ),
+            "source_url": info["compare"],
+            "source_type": "comparison_discovery",
+            "price_basis": "unverified_comparison_price",
+            "qty16_cost_pln": "",
+            "shipping": "not included / verify for Łęknica",
+            "stale_note": (
+                "Discovery only: confirm price, VAT, stock "
+                "and shipping at the seller."
+            ),
+        })
+
+    # Usuń duplikaty tego samego sklepu i tej samej ceny.
+    unique = {}
+    for row in results:
+        unique[(row["shop"], row["price"])] = row
+
+    return list(unique.values())
+
+
+# ------------------------------------------------------------
+# HISTORIA I AKTUALNE OFERTY
+# ------------------------------------------------------------
+
+def identity(row):
+    return (
+        row.get("model", ""),
+        row.get("shop", ""),
+        row.get("source_type", ""),
+        row.get("source_url", ""),
+    )
+
+
+def mark_stale(row, checked_at, reason):
+    result = dict(row)
+    result["checked_at_utc"] = checked_at
+
+    old_note = (result.get("stale_note") or "").strip()
+    new_note = "Nie odświeżono: " + reason
+
+    if new_note not in old_note:
+        result["stale_note"] = (
+            old_note + " | " + new_note
+        ).strip(" |")
+
+    return result
+
+
+def main():
+    checked_at = now_utc()
+
+    old_prices = read_csv(PRICES_FILE)
+    old_history = read_csv(HISTORY_FILE)
+
+    # Zachowujemy ewentualne dodatkowe kolumny obecnej historii.
+    history_fields = list(FIELDS)
+
+    for row in old_history:
+        for field in row:
+            if field and field not in history_fields:
+                history_fields.append(field)
+
+    fresh_rows = []
+    history_additions = []
+    failed_sources = 0
+    direct_count = 0
+    discovery_count = 0
+
+    # Przechowujemy wynik każdego sklepu osobno.
+    # Dzięki temu nie nadpisujemy starej oferty bezpośredniej
+    # wpisem z ComparePV.
+    attempted_direct = set()
+    successful_direct_fetch = set()
+    successful_compare_fetch = set()
+
+    for model, info in PANELS.items():
+        log(f"\n=== {model} ===")
+
+        for shop, template in DIRECT_SOURCES:
+            url = template.format(q=quote(info["search"]))
+            attempted_direct.add((model, shop))
+
+            try:
+                text, status, final_url = fetch_text(url)
+                successful_direct_fetch.add((model, shop))
+
+                row, reason = parse_direct(
+                    text, model, info, shop, url, checked_at
+                )
+
+                if row:
+                    fresh_rows.append(row)
+                    history_additions.append(row)
+                    direct_count += 1
+                    log(
+                        f"OK direct: {shop}: "
+                        f"{row['price']} PLN brutto"
+                    )
+                else:
+                    log(
+                        f"INFO direct: {shop}: {reason}; "
+                        f"HTTP={status}; tekst={len(text)} znaków"
+                    )
+
+            except Exception as exc:
+                failed_sources += 1
+                log(
+                    f"WARN direct: {shop}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        compare_url = info.get("compare")
+
+        if compare_url:
+            try:
+                text, status, final_url = fetch_text(compare_url)
+                successful_compare_fetch.add(model)
+
+                rows = parse_comparepv(
+                    text, model, info, checked_at
+                )
+
+                fresh_rows.extend(rows)
+                history_additions.extend(rows)
+                discovery_count += len(rows)
+
+                if rows:
+                    log(
+                        f"OK ComparePV: {len(rows)} "
+                        "ofert odkrywczych; nie są potwierdzone"
+                    )
+                else:
+                    log(
+                        "INFO ComparePV: nie udało się odczytać "
+                        f"wierszy ofert; HTTP={status}; "
+                        f"tekst={len(text)} znaków"
+                    )
+
+            except Exception as exc:
+                failed_sources += 1
+                log(
+                    f"WARN ComparePV: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        threshold = info.get("alert")
+
+        if threshold is not None:
+            for row in fresh_rows:
+                if row["model"] != model:
+                    continue
+
+                try:
+                    price = float(row["price"])
+                except (TypeError, ValueError):
+                    continue
+
+                if price > threshold:
+                    continue
+
+                if row["source_type"] == "direct_store":
+                    log(
+                        f"ALERT POTWIERDZONY: {model}, "
+                        f"{row['shop']}, {price:.2f} PLN brutto "
+                        f"(próg {threshold:.2f} PLN)"
+                    )
+                else:
+                    log(
+                        f"ALERT DO WERYFIKACJI: {model}, "
+                        f"{row['shop']}, {price:.2f} PLN "
+                        "(ComparePV; VAT i cena brutto niepotwierdzone)"
+                    )
+
+    # Aktualne oferty: nowe dane plus starsze rekordy, których
+    # nie udało się odświeżyć. Starych cen nie kasujemy.
+    current_by_identity = {}
+
+    for row in fresh_rows:
+        current_by_identity[identity(row)] = row
+
+    fresh_direct_shops = {
+        (row["model"], row["shop"])
+        for row in fresh_rows
+        if row["source_type"] == "direct_store"
+    }
+
+    fresh_compare_models = {
+        row["model"]
+        for row in fresh_rows
+        if row["source_type"] == "comparison_discovery"
+    }
+
+    for old in old_prices:
+        model = old.get("model", "")
+        shop = old.get("shop", "")
+        source_type = old.get("source_type", "")
+
+        if source_type == "direct_store":
+            key = (model, shop)
+
+            if key in fresh_direct_shops:
+                continue
+
+            if key in successful_direct_fetch:
+                reason = (
+                    "pobranie działa, ale nie znaleziono "
+                    "zweryfikowanej ceny brutto"
+                )
+            else:
+                reason = "błąd odświeżania źródła"
+
+            stale = mark_stale(old, checked_at, reason)
+            current_by_identity.setdefault(identity(stale), stale)
+
+        elif source_type in (
+            "comparison_discovery",
+            "legacy_comparepv",
+        ):
+            if model in fresh_compare_models:
+                # Świeże dane ComparePV zastępują stare dane
+                # odkrywcze tego modelu.
+                continue
+
+            if model in successful_compare_fetch:
+                reason = "nie odczytano aktualnych ofert z ComparePV"
+            else:
+                reason = "nie udało się odświeżyć ComparePV"
+
+            stale = mark_stale(old, checked_at, reason)
+            current_by_identity.setdefault(identity(stale), stale)
+
+        else:
+            # Nieznany typ źródła — zachowaj rekord.
+            current_by_identity.setdefault(identity(old), old)
+
+    current_rows = list(current_by_identity.values())
+
+    # Zachowaj kolejność kolumn i dodatkowe kolumny, jeśli były.
+    atomic_write_csv(PRICES_FILE, FIELDS, current_rows)
+
+    # Historia jest dopisywana, nigdy nie tworzona od nowa z samych
+    # bieżących ofert. Stare wpisy pozostają bez zmian.
+    history_rows = list(old_history)
+    history_rows.extend(history_additions)
+
+    atomic_write_csv(HISTORY_FILE, history_fields, history_rows)
+
+    log("\n=== PODSUMOWANIE ===")
+    log(f"Aktualne rekordy: {len(current_rows)}")
+    log(f"Nowe obserwacje bezpośrednie: {direct_count}")
+    log(f"Nowe obserwacje ComparePV: {discovery_count}")
+    log(f"Łącznie rekordów historii: {len(history_rows)}")
+    log(f"Błędy pobierania źródeł: {failed_sources}")
+    log("Ceny z ComparePV nie są traktowane jako potwierdzone ceny brutto.")
+
+    # Zwróć błąd, jeśli każde źródło bezpośrednie zawiodło
+    # i nie udało się odczytać żadnej porównywarki.
+    total_sources = len(PANELS) * len(DIRECT_SOURCES)
+    if failed_sources >= total_sources and direct_count == 0:
+        log("ERROR: sprawdź logi — pobieranie źródeł nie działa.")
+        return 2
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
