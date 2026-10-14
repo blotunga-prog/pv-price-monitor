@@ -637,3 +637,97 @@ def main():
 
                 if price <= threshold:
                     log(
+                        f"ALERT POTWIERDZONY: {model}, "
+                        f"{row['shop']}, {price:.2f} PLN brutto "
+                        f"(próg {threshold:.2f} PLN)"
+                    )
+
+    current_by_identity = {}
+
+    for row in fresh_rows:
+        current_by_identity[identity(row)] = row
+
+    fresh_direct_shops = {
+        (row["model"], row["shop"])
+        for row in fresh_rows
+        if row["source_type"] == "direct_store"
+    }
+
+    fresh_compare_models = {
+        row["model"]
+        for row in fresh_rows
+        if row["source_type"] == "comparison_discovery"
+    }
+
+    for old in old_prices:
+        model = old.get("model", "")
+        shop = old.get("shop", "")
+        source_type = old.get("source_type", "")
+
+        if source_type == "direct_store":
+            key = (model, shop)
+
+            if key in fresh_direct_shops:
+                continue
+
+            if key in successful_direct_fetch:
+                reason = (
+                    "pobranie działa, ale nie znaleziono "
+                    "zweryfikowanej ceny brutto"
+                )
+            else:
+                reason = "błąd odświeżania źródła"
+
+            stale = mark_stale(old, checked_at, reason)
+            current_by_identity.setdefault(identity(stale), stale)
+
+        elif source_type in (
+            "comparison_discovery",
+            "legacy_comparepv",
+        ):
+            if model in fresh_compare_models:
+                continue
+
+            if model in successful_compare_fetch:
+                reason = "nie odczytano aktualnych ofert z ComparePV"
+            else:
+                reason = "nie udało się odświeżyć ComparePV"
+
+            stale = mark_stale(old, checked_at, reason)
+            current_by_identity.setdefault(identity(stale), stale)
+
+        else:
+            current_by_identity.setdefault(identity(old), old)
+
+    current_rows = list(current_by_identity.values())
+
+    price_fields = csv_fields(FIELDS, old_prices)
+    atomic_write_csv(PRICES_FILE, price_fields, current_rows)
+
+    history_rows = list(old_history)
+    history_rows.extend(history_additions)
+
+    history_fields = csv_fields(FIELDS, history_rows)
+    atomic_write_csv(HISTORY_FILE, history_fields, history_rows)
+
+    log("\n=== PODSUMOWANIE ===")
+    log(f"Aktualne rekordy: {len(current_rows)}")
+    log(f"Nowe obserwacje bezpośrednie: {direct_count}")
+    log(f"Nowe obserwacje ComparePV: {discovery_count}")
+    log(f"Łącznie rekordów historii: {len(history_rows)}")
+    log(f"Błędy pobierania źródeł: {failed_sources}")
+    log(
+        "ComparePV pozostaje źródłem odkrywczym; "
+        "nie jest traktowane jako potwierdzona cena brutto."
+    )
+
+    total_sources = len(PANELS) * len(DIRECT_SOURCES)
+
+    if failed_sources >= total_sources and direct_count == 0:
+        log("ERROR: sprawdź logi — pobieranie źródeł nie działa.")
+        return 2
+
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
