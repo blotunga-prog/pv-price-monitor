@@ -129,20 +129,20 @@ SESSION.headers.update({
 })
 
 def log(message):
-print(message, flush=True)
+    print(message, flush=True)
 
 def now_utc():
-return datetime.now(timezone.utc).replace(
-microsecond=0
-).isoformat()
+    return datetime.now(timezone.utc).replace(
+        microsecond=0
+    ).isoformat()
 
 def norm(value):
-value = (value or "").replace("\u00a0", " ")
-value = value.replace("\u202f", " ")
+    value = (value or "").replace("\u00a0", " ")
+    value = value.replace("\u202f", " ")
 return re.sub(r"\s+", " ", value).strip().casefold()
 
 def atomic_write_csv(path, fields, rows):
-path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
 fd, temp_name = tempfile.mkstemp(
     prefix=path.name + ".",
@@ -177,8 +177,8 @@ except Exception:
     raise
 
 def read_csv(path):
-if not path.exists():
-return []
+    if not path.exists():
+        return []
 
 with path.open(
     "r", newline="", encoding="utf-8-sig"
@@ -186,7 +186,7 @@ with path.open(
     return list(csv.DictReader(handle))
 
 def csv_fields(base_fields, rows):
-result = list(base_fields)
+    result = list(base_fields)
 
 for row in rows:
     for field in row:
@@ -196,7 +196,7 @@ for row in rows:
 return result
 
 def exact_model_match(text, info):
-haystack = norm(text).replace(" ", "")
+    haystack = norm(text).replace(" ", "")
 
 for alias in info["aliases"]:
     needle = norm(alias).replace(" ", "")
@@ -206,8 +206,8 @@ for alias in info["aliases"]:
 return False
 
 def parse_number(raw):
-raw = raw.replace("\u00a0", " ")
-raw = re.sub(r"\s+", "", raw)
+    raw = raw.replace("\u00a0", " ")
+    raw = re.sub(r"\s+", "", raw)
 
 if "," in raw and "." in raw:
     if raw.rfind(",") > raw.rfind("."):
@@ -231,7 +231,7 @@ re.IGNORECASE,
 )
 
 def model_context(text, info):
-lines = (text or "").splitlines()
+    lines = (text or "").splitlines()
 aliases = [
 norm(alias).replace(" ", "")
 for alias in info["aliases"]
@@ -262,7 +262,7 @@ end = min(len(lines), index + 23)
 return "\n".join(lines[start:end])
 
 def explicit_gross_price(text):
-lines = (text or "").splitlines()
+    lines = (text or "").splitlines()
 
 gross_re = re.compile(
     r"(brutto|cena\s+z\s+vat|z\s+vat|vat\s+wliczony|"
@@ -308,7 +308,7 @@ for index, line in enumerate(lines):
 return None
 
 def stock_quantity(text):
-patterns = [
+    patterns = [
 r"(\d[\d ])\sszt.?",
 r"(\d[\d ])\spcs\b",
 ]
@@ -329,7 +329,7 @@ for line in (text or "").splitlines():
 return ""
 
 def stock_status(text):
-value = norm(text)
+    value = norm(text)
 
 if any(term in value for term in (
     "brak w magazynie",
@@ -356,9 +356,9 @@ if any(term in value for term in (
 return "Not stated"
 
 def shipping_info(text):
-for line in (text or "").splitlines():
-if not re.search(r"wysyłka\s+od|wysylka\s+od", line, re.IGNORECASE):
-continue
+    for line in (text or "").splitlines():
+        if not re.search(r"wysyłka\s+od|wysylka\s+od",line, re.IGNORECASE):
+        	continue
 
     match = PRICE_RE.search(line)
     if match:
@@ -372,7 +372,7 @@ continue
 return "Nie odczytano; potwierdzić dla 16 szt. do Łęknicy"
 
 def fetch_text(url):
-reader_url = "https://r.jina.ai/" + url
+	reader_url = "https://r.jina.ai/" + url
 
 headers = {}
 api_key = os.getenv("JINA_API_KEY", "").strip()
@@ -393,8 +393,8 @@ if not response.text.strip():
 return response.text, response.status_code, response.url
 
 def parse_direct(text, model, info, shop, url, checked_at):
-if not exact_model_match(text, info):
-return None, "nie znaleziono dokładnego kodu modelu"
+	if not exact_model_match(text, info):
+		return None, "nie znaleziono dokładnego kodu modelu"
 
 context = model_context(text, info)
 price = explicit_gross_price(context)
@@ -437,7 +437,7 @@ KNOWN_SHOPS = [
 ]
 
 def parse_comparepv(text, model, info, checked_at):
-results = []
+	results = []
 lines = (text or "").splitlines()
 
 if not exact_model_match(text, info):
@@ -507,7 +507,7 @@ for row in results:
 return list(unique.values())
 
 def identity(row):
-return (
+	return (
 row.get("model", ""),
 row.get("shop", ""),
 row.get("source_type", ""),
@@ -515,7 +515,7 @@ row.get("source_url", ""),
 )
 
 def mark_stale(row, checked_at, reason):
-result = dict(row)
+	result = dict(row)
 
 old_note = (result.get("stale_note") or "").strip()
 new_note = "Nie odświeżono: " + reason
@@ -528,7 +528,7 @@ if new_note not in old_note:
 return result
 
 def main():
-checked_at = now_utc()
+	checked_at = now_utc()
 
 old_prices = read_csv(PRICES_FILE)
 old_history = read_csv(HISTORY_FILE)
@@ -734,4 +734,4 @@ if failed_sources >= total_sources and direct_count == 0:
 return 0
 
 if name == "main":
-sys.exit(main())
+	sys.exit(main())
